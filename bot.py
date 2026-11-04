@@ -248,26 +248,97 @@ async def list_groups(bot,uid,cid):
         await bot.send_message(cid,text,reply_markup=kb(row))
 
 
+def regular_start_text():
+    with conn() as c:
+        r=c.execute("SELECT val FROM meta WHERE key='regular_start_text'").fetchone()
+    return r['val'] if r else '🛡️ ברוכים הבאים לבוט CINEMIX לניהול קבוצות!\nלחץ על הקבוצות שלי כדי להתחיל.'
+
+
+async def owner_panel(update,context):
+    if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:
+        return
+    await update.message.reply_text('👑 פאנל הבעלים של CINEMIX\n/groups — כל הקבוצות\n/setstart טקסט — שינוי הודעת הפתיחה\n/showstart — הצגת הודעת הפתיחה',reply_markup=kb([('👥 כל הקבוצות','list:all:0')],[('📖 מדריך','guide:all:0')]))
+    await list_groups(context.bot,OWNER,update.effective_chat.id)
+
+
+async def set_start_text(update,context):
+    if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:return
+    value=update.message.text.partition(' ')[2].strip()
+    if not value:
+        await update.message.reply_text('שלח: /setstart ההודעה החדשה')
+        return
+    if len(value)>3500:
+        await update.message.reply_text('הטקסט ארוך מדי (עד 3500 תווים).')
+        return
+    with conn() as c:
+        c.execute("INSERT OR REPLACE INTO meta(key,val) VALUES ('regular_start_text',?)",(value,));c.commit()
+    await update.message.reply_text('✅ הודעת הפתיחה עודכנה.')
+
+
+async def show_start_text(update,context):
+    if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:return
+    await update.message.reply_text(regular_start_text())
+
+
 async def start(update,context):
     if update.effective_chat.type!='private':return
-    u=update.effective_user
-    await update.message.reply_text(('👑 פאנל הבעלים של CINEMIX' if u.id==OWNER else '🛡️ CINEMIX ניהול קבוצות')+'\nבחר קבוצה לניהול:',reply_markup=kb([('👥 הקבוצות שלי','list:all:0')],[('📖 מדריך','guide:all:0')]))
-    await list_groups(context.bot,u.id,update.effective_chat.id)
+    if update.effective_user.id==OWNER:
+        await owner_panel(update,context)
+    else:
+        await update.message.reply_text(regular_start_text(),reply_markup=kb([('👥 הקבוצות שלי','list:all:0')],[('📖 מדריך','guide:all:0')]))
 
 
 async def manage(update,context):
-    chat=update.effective_chat; uid=update.effective_user.id
+    chat=update.effective_chat;uid=update.effective_user.id
     if chat.type!='private':
         await safe_delete(context.bot,chat.id,update.message.message_id)
+        if not get_group(chat.id):
+            upsert(chat.id,chat.title or str(chat.id))
+            await notify_owner(context.bot,chat.id)
         if not await authorized(context.bot,uid,chat.id):return
         try:await context.bot.send_message(uid,'⚙️ ניהול קבוצות:',reply_markup=kb([('👥 בחר קבוצה','list:all:0')]))
         except TelegramError:
-            await context.bot.send_message(chat.id,'כדי לנהל בפרטי, פתח קודם את הבוט ולחץ Start.')
-    else:await list_groups(context.bot,uid,chat.id)
+            await context.bot.send_message(chat.id,'פתח תחילה את הבוט בפרטי ולחץ Start.')
+    else:
+        await list_groups(context.bot,uid,chat.id)
 
 
 async def groups_cmd(update,context):
-    if update.effective_chat.type=='private':await list_groups(context.bot,update.effective_user.id,update.effective_chat.id)
+    if update.effective_chat.type=='private':
+        await list_groups(context.bot,update.effective_user.id,update.effective_chat.id)
+
+
+async def track_group(update,context):
+    """Re-discover groups from any incoming update, including commands and service messages.
+    Never grant approval merely because the group was discovered.
+    """
+    chat=update.effective_chat
+    if not chat or chat.type not in ('group','supergroup'):
+        return
+    if not get_group(chat.id):
+        upsert(chat.id,chat.title or str(chat.id))
+        log.info('Registered group %s (%s) from update',chat.id,chat.title)
+        await notify_owner(context.bot,chat.id)
+    elif chat.title and get_group(chat.id)['title']!=chat.title:
+        upsert(chat.id,chat.title)
+
+
+async def register_group(update,context):
+    """Explicit group recovery after a database reset."""
+    chat=update.effective_chat
+    if chat.type not in ('group','supergroup'):
+        return
+    user=update.effective_user
+    if not user or not await authorized(context.bot,user.id,chat.id):
+        return
+    await safe_delete(context.bot,chat.id,update.message.message_id)
+    g=get_group(chat.id)
+    if not g:
+        upsert(chat.id,chat.title or str(chat.id))
+        await notify_owner(context.bot,chat.id)
+        g=get_group(chat.id)
+    await context.bot.send_message(chat.id,
+        '✅ הקבוצה נרשמה במערכת. ' + ('הקבוצה מאושרת.' if g['approved'] else 'ממתינה לאישור בעל הבוט.'))
 
 
 def page_keyboard(cid,page):
@@ -324,8 +395,10 @@ async def callbacks(update,context):
         await q.edit_message_text(f'👑 הקבוצה {get_group(cid)["title"]}: {"מאושרת" if value=="1" else "לא מאושרת"}')
         return
     g=get_group(cid)
-    if not g or not g['approved']:
-        await q.answer('הקבוצה לא אושרה',show_alert=True);return
+    if not g:
+        await q.answer('הקבוצה לא רשומה. שלח /register בקבוצה ואז אשר אותה בפרטי.',show_alert=True);return
+    if not g['approved']:
+        await q.answer('הקבוצה ממתינה לאישור. פתח /admin ואשר אותה.',show_alert=True);return
     if action=='verify':
         if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
         with conn() as c:
@@ -565,7 +638,7 @@ async def moderate(update,context):
     msg=update.effective_message;cid=msg.chat_id;g=get_group(cid)
     if not g or not g['approved']:return
     if msg.sender_chat and cfg(cid)['channel_posts_delete']:
-        if msg.sender_chat.id!=cid:
+        if msg.sender_chat.type=='channel' and msg.sender_chat.id!=cid:
             await safe_delete(context.bot,cid,msg.message_id)
             return
     if not msg.from_user:return
@@ -797,8 +870,13 @@ def main():
     if not TOKEN:raise RuntimeError('Set BOT_TOKEN in Render environment variables')
     conn().close()
     app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS,track_group),group=-1)
     app.add_handler(CommandHandler('start',start))
+    app.add_handler(CommandHandler('admin',owner_panel))
+    app.add_handler(CommandHandler('setstart',set_start_text))
+    app.add_handler(CommandHandler('showstart',show_start_text))
     app.add_handler(CommandHandler('manage',manage))
+    app.add_handler(CommandHandler('register',register_group))
     app.add_handler(CommandHandler('groups',groups_cmd))
     app.add_handler(CommandHandler('cancel',cancel))
     app.add_handler(CallbackQueryHandler(callbacks))

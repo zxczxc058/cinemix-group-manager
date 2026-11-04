@@ -94,6 +94,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS invitations (chat INTEGER PRIMARY KEY, inviter INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS stats (chat INTEGER, kind TEXT, amount INTEGER DEFAULT 0, PRIMARY KEY(chat,kind))')
     c.execute('CREATE TABLE IF NOT EXISTS drafts (uid INTEGER PRIMARY KEY, chat INTEGER, kind TEXT, payload TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS group_requests (chat INTEGER PRIMARY KEY, notified INTEGER DEFAULT 0, requested_at INTEGER)')
     c.commit()
     return c
 
@@ -242,11 +243,53 @@ async def safe_delete(bot,cid,mid):
 
 
 async def notify_owner(bot,cid):
+    """Send one owner approval request per pending group, retry if delivery fails."""
     g=get_group(cid)
-    if not g:return
+    if not g or g['approved'] or not g['active']:
+        return False
+    with conn() as c:
+        row=c.execute('SELECT notified FROM group_requests WHERE chat=?',(cid,)).fetchone()
+        if row and row['notified']:
+            return False
+        c.execute('INSERT OR IGNORE INTO group_requests(chat,notified,requested_at) VALUES (?,0,?)',(cid,int(time.time())))
+        c.commit()
+    with conn() as c:
+        invitation=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
+    who=f"\nמבקש: {invitation['inviter']}" if invitation else ''
     try:
-        await bot.send_message(OWNER,f'📥 בקשת אישור חדשה\n{g["title"]}\nID: {cid}',reply_markup=kb([('✅ אישור',f'approval:1:{cid}'),('❌ דחייה',f'approval:0:{cid}')]))
-    except TelegramError:log.exception('Owner notification')
+        await bot.send_message(OWNER,f'📥 בקשת אישור חדשה\n{g["title"]}\nID: {cid}{who}',reply_markup=kb([('✅ אישור',f'approval:1:{cid}'),('❌ דחייה',f'approval:0:{cid}')]))
+    except TelegramError:
+        log.exception('Owner notification failed for group %s',cid)
+        return False
+    with conn() as c:
+        c.execute('UPDATE group_requests SET notified=1 WHERE chat=?',(cid,))
+        c.commit()
+    return True
+
+
+async def request_group_approval(bot,chat,inviter=None,force=False):
+    """Register and request approval, without exposing management before approval."""
+    g=get_group(chat.id)
+    if not g:
+        upsert(chat.id,chat.title or str(chat.id))
+        g=get_group(chat.id)
+    if inviter:
+        with conn() as c:
+            c.execute('INSERT OR IGNORE INTO invitations(chat,inviter) VALUES (?,?)',(chat.id,inviter))
+            c.commit()
+    if g['approved']:
+        return 'approved'
+    if force:
+        # A manual /register repairs a missed owner notification from older builds.
+        with conn() as c:
+            c.execute('INSERT OR IGNORE INTO group_requests(chat,notified,requested_at) VALUES (?,0,?)',(chat.id,int(time.time())))
+            c.commit()
+    sent=await notify_owner(bot,chat.id)
+    if sent:
+        return 'sent'
+    with conn() as c:
+        row=c.execute('SELECT notified FROM group_requests WHERE chat=?',(chat.id,)).fetchone()
+    return 'pending' if row and row['notified'] else 'failed'
 
 
 async def my_member(update,context):
@@ -257,18 +300,24 @@ async def my_member(update,context):
     after=ev.new_chat_member.status
     active=(ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
     if after in active:
-        if before not in active and ev.from_user:
-            with conn() as c:
-                c.execute('INSERT OR REPLACE INTO invitations(chat,inviter) VALUES (?,?)',(ev.chat.id,ev.from_user.id));c.commit()
-        old=get_group(ev.chat.id)
-        upsert(ev.chat.id,ev.chat.title or str(ev.chat.id))
-        if not old:
-            await notify_owner(context.bot,ev.chat.id)
-            try:await context.bot.send_message(ev.chat.id,'✅ הבקשה נשלחה לבעלים לאישור.')
-            except TelegramError:pass
+        if before not in active:
+            old=get_group(ev.chat.id)
+            if not old:
+                upsert(ev.chat.id,ev.chat.title or str(ev.chat.id))
+            else:
+                upsert(ev.chat.id,ev.chat.title or str(ev.chat.id))
+            result=await request_group_approval(context.bot,ev.chat,ev.from_user.id if ev.from_user else None)
+            if result!='approved':
+                message='✅ הבקשה נשלחה לבעלים לאישור.' if result in ('sent','pending') else '⚠️ לא הצלחנו להעביר את הבקשה לבעלים. נסו /register.'
+                try:await context.bot.send_message(ev.chat.id,message)
+                except TelegramError:log.exception('Cannot send group request confirmation')
+        elif not get_group(ev.chat.id):
+            result=await request_group_approval(context.bot,ev.chat,ev.from_user.id if ev.from_user else None)
+            if result!='approved':
+                try:await context.bot.send_message(ev.chat.id,'✅ הבקשה נשלחה לבעלים לאישור.' if result!='failed' else '⚠️ הבקשה לא הועברה לבעלים.')
+                except TelegramError:pass
     elif after in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED) and before in active:
-        # Preserve approval and settings across a temporary removal or restart.
-        set_group(ev.chat.id, active=0)
+        set_group(ev.chat.id,active=0)
         log.info('Bot removed from group %s (settings retained)',ev.chat.id)
 
 
@@ -438,16 +487,20 @@ async def start(update,context):
 async def manage(update,context):
     chat=update.effective_chat;uid=update.effective_user.id
     if chat.type!='private':
-        await safe_delete(context.bot,chat.id,update.message.message_id)
-        if not await ensure_group(context.bot,chat):
-            return
         if not await authorized(context.bot,uid,chat.id):return
+        g=get_group(chat.id)
+        if not g or not g['approved']:
+            result=await request_group_approval(context.bot,chat,uid,force=True)
+            await context.bot.send_message(chat.id,'✅ הבקשה נשלחה לבעלים לאישור.' if result!='failed' else '⚠️ הבקשה לא הועברה לבעלים. נסו שוב מאוחר יותר.')
+            return
+        await safe_delete(context.bot,chat.id,update.message.message_id)
         try:await context.bot.send_message(uid,'⚙️ ניהול קבוצות:',reply_markup=kb([('👥 בחר קבוצה','list:all:0')]))
-        except TelegramError:
-            await context.bot.send_message(chat.id,'פתח תחילה את הבוט בפרטי ולחץ Start.')
+        except TelegramError:await context.bot.send_message(chat.id,'פתח תחילה את הבוט בפרטי ולחץ Start.')
     else:
         if uid==OWNER or any(g['approved'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
             await list_groups(context.bot,uid,chat.id)
+        else:
+            await update.message.reply_text(regular_start_text())
 
 
 async def groups_cmd(update,context):
@@ -456,31 +509,26 @@ async def groups_cmd(update,context):
 
 
 async def track_group(update,context):
-    chat=update.effective_chat
-    if not chat or chat.type not in ('group','supergroup'):
-        return
-    # Membership transitions are handled exclusively by MY_CHAT_MEMBER.
-    # A left_chat_member service message must never create a new approval request.
-    msg=update.effective_message
-    if msg and (msg.left_chat_member or msg.new_chat_members):
-        return
-    await ensure_group(context.bot,chat)
+    # Do not silently register groups here: doing so before MY_CHAT_MEMBER
+    # suppresses the owner approval request for a newly added bot.
+    return
 
 
 async def register_group(update,context):
-    """Explicit group recovery after a database reset."""
     chat=update.effective_chat
     if chat.type not in ('group','supergroup'):
         return
     user=update.effective_user
     if not user or not await authorized(context.bot,user.id,chat.id):
         return
-    await safe_delete(context.bot,chat.id,update.message.message_id)
-    if not await ensure_group(context.bot,chat):
-        return
-    g=get_group(chat.id)
-    await context.bot.send_message(chat.id,
-        '✅ הקבוצה נרשמה במערכת. ' + ('הקבוצה מאושרת.' if g['approved'] else 'ממתינה לאישור בעל הבוט.'))
+    result=await request_group_approval(context.bot,chat,user.id,force=True)
+    if result=='approved':
+        text='✅ הקבוצה כבר מאושרת במערכת.'
+    elif result=='failed':
+        text='⚠️ לא הצלחנו להעביר את הבקשה לבעלים. בדקו שהבעלים פתח את הבוט בפרטי ונסו שוב.'
+    else:
+        text='✅ הבקשה נשלחה לבעלים לאישור.'
+    await context.bot.send_message(chat.id,text)
 
 
 def broadcast_picker(payload):
@@ -555,6 +603,9 @@ async def callbacks(update,context):
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
         if not get_group(cid):await q.answer('קבוצה לא נמצאה');return
         set_group(cid,approved=int(value));await q.answer('עודכן')
+        with conn() as c:
+            c.execute('DELETE FROM group_requests WHERE chat=?',(cid,))
+            c.commit()
         decision='✅ הקבוצה אושרה להפעלת CINEMIX. מנהלי הקבוצה יכולים כעת לפתוח ניהול בפרטי.' if value=='1' else '❌ הקבוצה לא אושרה לשימוש ב-CINEMIX. הבוט לא יבצע פעולות ניהול בקבוצה.'
         try:await context.bot.send_message(cid,decision)
         except TelegramError:log.warning('Cannot announce approval in %s',cid)
@@ -647,7 +698,7 @@ async def callbacks(update,context):
         draft_clear(uid);clear_pending(uid);await q.answer('בוטל');await q.message.reply_text('❌ הפרסום בוטל');return
     if action=='wizardpreview':
         d=draft_get(uid)
-        if not d or (d[1]!='broadcast' and d[0]!=cid):await q.answer('אין טיוטה. התחל פרסום חדש.',show_alert=True);return
+        if not d or d[0]!=cid:await q.answer('אין טיוטה. התחל פרסום חדש.',show_alert=True);return
         await q.answer()
         payload=d[2]
         if value=='save' and d[1] in ('reply','announcement'):
@@ -704,7 +755,7 @@ async def callbacks(update,context):
         elif value=='one':targets=[d[0]]
         else:await q.answer('אין הרשאה');return
         payload['targets']=targets;cid=d[0];draft_set(uid,cid,'broadcast',payload)
-        await q.answer();await q.message.reply_text(f'📣 תצוגה מקדימה\n\n{html.unescape(re.sub(r'<[^>]*>', '', payload.get('text','').removeprefix('HTML:')))[:1200]}\n\nיעדים: {len(targets)}\nלא נשלח עדיין.',reply_markup=kb([('✅ אשר ושלח',f'wizardpreview:send:{d[0]}'),('❌ בטל',f'wizardpreview:cancel:{d[0]}')]))
+        await q.answer();await q.message.reply_text(f'📣 תצוגה מקדימה\n\n{html.unescape(re.sub(r'<[^>]*>', '', payload.get('text','').removeprefix('HTML:')))[:1200]}\n\nיעדים: {len(targets)}\nלא נשלח עדיין.',reply_markup=kb([('✅ אשר ושלח',f'wizardpreview:send:{d[0]}'),('❌ בטל',f'wizardpreview:cancel:{cid}')]))
         return
     if action=='ownerall':
         if uid!=OWNER:await q.answer('רק בעל הבוט');return
@@ -957,7 +1008,7 @@ async def wizard_preview(update,context,cid,kind,payload):
         desc=f'🤖 תצוגה מקדימה\nטריגר: {payload["trigger"]}\nהתאמה: {payload["mode"]}\nתגובה: {payload["text"]}\nכפתורים: {len(payload.get("buttons",[]))}\nמדיה: {"כן" if payload.get("media") else "לא"}'
     else:
         desc=f'⏰ תצוגה מקדימה\nכל {payload["minutes"]} דקות\n{payload["text"]}\nמחיקת הקודם: {"כן" if payload.get("delete_previous") else "לא"}\nכפתורים: {len(payload.get("buttons",[]))}'
-    await update.message.reply_text(desc,reply_markup=kb([('✅ שמור',f'wizardpreview:save:{cid}'),('❌ בטל',f'wizardpreview:cancel:{d[0]}')]))
+    await update.message.reply_text(desc,reply_markup=kb([('✅ שמור',f'wizardpreview:save:{cid}'),('❌ בטל',f'wizardpreview:cancel:{cid}')]))
     try:
         await send_formatted(context.bot,update.effective_user.id,payload['text'],markup=buttons(payload.get('buttons')),media=payload.get('media'))
     except TelegramError:
@@ -1397,7 +1448,6 @@ def main():
     if not TOKEN:raise RuntimeError('Set BOT_TOKEN in Render environment variables')
     conn().close()
     app=ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS,track_group),group=-1)
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CommandHandler('admin',owner_panel))
     app.add_handler(CommandHandler('setstart',set_start_text))

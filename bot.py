@@ -73,7 +73,9 @@ def conn():
     old_columns=[r[1] for r in c.execute('PRAGMA table_info(groups)')]
     if old_columns and 'chat_id' in old_columns and 'id' not in old_columns:
         c.execute('ALTER TABLE groups RENAME TO groups_legacy')
-    c.execute('CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY, title TEXT, approved INTEGER DEFAULT 0, settings TEXT, locked INTEGER DEFAULT 0, permissions TEXT, lock_reason TEXT, last_announcement INTEGER DEFAULT 0)')
+    c.execute('CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY, title TEXT, approved INTEGER DEFAULT 0, settings TEXT, locked INTEGER DEFAULT 0, permissions TEXT, lock_reason TEXT, last_announcement INTEGER DEFAULT 0, active INTEGER DEFAULT 1)')
+    if 'active' not in [r[1] for r in c.execute('PRAGMA table_info(groups)')]:
+        c.execute('ALTER TABLE groups ADD COLUMN active INTEGER DEFAULT 1')
     legacy=[r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='groups_legacy'")]
     if legacy:
         for old in c.execute('SELECT * FROM groups_legacy').fetchall():
@@ -88,6 +90,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS welcomes (chat INTEGER PRIMARY KEY, mid INTEGER, expires INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS mutes (chat INTEGER, uid INTEGER, original TEXT, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS pending_edits (uid INTEGER PRIMARY KEY, chat INTEGER, field TEXT)')
     c.commit()
     return c
 
@@ -127,12 +130,12 @@ def set_cfg(cid, key, value):
 def upsert(cid,title):
     initial=owner_defaults()
     with conn() as c:
-        c.execute('INSERT INTO groups(id,title,settings) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title',(cid,title,json.dumps(initial,ensure_ascii=False)))
+        c.execute('INSERT INTO groups(id,title,settings,active) VALUES (?,?,?,1) ON CONFLICT(id) DO UPDATE SET title=excluded.title, active=1',(cid,title,json.dumps(initial,ensure_ascii=False)))
         c.commit()
 
 
 def set_group(cid, **kw):
-    allowed={'approved','locked','permissions','lock_reason','last_announcement'}
+    allowed={'approved','locked','permissions','lock_reason','last_announcement','active'}
     kw={k:v for k,v in kw.items() if k in allowed}
     if not kw:return
     with conn() as c:
@@ -140,7 +143,7 @@ def set_group(cid, **kw):
 
 
 def all_groups():
-    with conn() as c: return [dict(x) for x in c.execute('SELECT * FROM groups ORDER BY title')]
+    with conn() as c: return [dict(x) for x in c.execute('SELECT * FROM groups WHERE active=1 ORDER BY title')]
 
 
 def warn_count(cid,uid,delta=0):
@@ -223,11 +226,9 @@ async def my_member(update,context):
         if not old:
             await notify_owner(context.bot,ev.chat.id)
     elif after in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED) and before in active:
-        # A removal is NOT a request for approval. Do not re-register it from service messages.
-        with conn() as c:
-            c.execute('DELETE FROM groups WHERE id=?',(ev.chat.id,))
-            c.commit()
-        log.info('Bot removed from group %s',ev.chat.id)
+        # Preserve approval and settings across a temporary removal or restart.
+        set_group(ev.chat.id, active=0)
+        log.info('Bot removed from group %s (settings retained)',ev.chat.id)
 
 
 async def ensure_group(bot,chat,notify=True):
@@ -238,6 +239,16 @@ async def ensure_group(bot,chat,notify=True):
     if existing:
         if chat.title and existing['title'] != chat.title:
             upsert(chat.id,chat.title)
+        if not existing.get('active', 1):
+            # An old group is not silently reactivated by unrelated service messages.
+            try:
+                me=await bot.get_me()
+                member=await bot.get_chat_member(chat.id,me.id)
+                if member.status not in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):
+                    return False
+            except TelegramError:
+                return False
+            set_group(chat.id,active=1)
         return True
     try:
         me=await bot.get_me()
@@ -272,7 +283,9 @@ async def list_groups(bot,uid,cid):
     for g in all_groups():
         if uid==OWNER or (g['approved'] and await authorized(bot,uid,g['id'])):groups.append(g)
     if not groups:
-        await bot.send_message(cid,('אין קבוצות רשומות כרגע. אם הבוט כבר מנהל קבוצה, שלח בה /register כדי לרשום אותה מחדש.' if uid==OWNER else 'אין כרגע קבוצות מאושרות שאתה מנהל.'));return
+        if uid==OWNER:
+            await bot.send_message(cid,'אין כרגע קבוצות פעילות ברשימה. אם הבוט נמצא בקבוצה, שלח בה /register כדי לרשום אותה מחדש.')
+        return
     for g in groups:
         title=g['title'][:50]
         text=f'👥 {title}\nסטטוס: {"מאושרת" if g["approved"] else "ממתינה לאישור"}'
@@ -298,7 +311,9 @@ async def set_start_text(update,context):
     if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:return
     value=update.message.text.partition(' ')[2].strip()
     if not value:
-        await update.message.reply_text('שלח: /setstart ההודעה החדשה')
+        with conn() as c:
+            c.execute("INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,0,'owner_start_text')",(OWNER,));c.commit()
+        await update.message.reply_text('✏️ שלח עכשיו בהודעה רגילה את טקסט הפתיחה למשתמשים. /cancel לביטול.')
         return
     if len(value)>3500:
         await update.message.reply_text('הטקסט ארוך מדי (עד 3500 תווים).')
@@ -318,7 +333,8 @@ async def start(update,context):
     if update.effective_user.id==OWNER:
         await owner_panel(update,context)
     else:
-        await update.message.reply_text(regular_start_text(),reply_markup=kb([('👥 הקבוצות שלי','list:all:0')],[('📖 מדריך','guide:all:0')]))
+        # Ordinary users only see the owner's welcome message, not management menus.
+        await update.message.reply_text(regular_start_text())
 
 
 async def manage(update,context):
@@ -332,12 +348,13 @@ async def manage(update,context):
         except TelegramError:
             await context.bot.send_message(chat.id,'פתח תחילה את הבוט בפרטי ולחץ Start.')
     else:
-        await list_groups(context.bot,uid,chat.id)
+        if uid==OWNER or any(g['approved'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
+            await list_groups(context.bot,uid,chat.id)
 
 
 async def groups_cmd(update,context):
-    if update.effective_chat.type=='private':
-        await list_groups(context.bot,update.effective_user.id,update.effective_chat.id)
+    if update.effective_chat.type=='private' and update.effective_user.id==OWNER:
+        await list_groups(context.bot,OWNER,update.effective_chat.id)
 
 
 async def track_group(update,context):
@@ -414,6 +431,8 @@ async def callbacks(update,context):
     if action=='list':
         await q.answer();await list_groups(context.bot,uid,q.message.chat_id);return
     if action=='guide':
+        if uid!=OWNER and not any(g['approved'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
+            await q.answer('אין הרשאה',show_alert=True);return
         await q.answer();await q.message.reply_text('📖 מדריך CINEMIX\n\n'+'\n\n'.join(HELP.values())[:3900]);return
     if action=='approval':
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
@@ -422,8 +441,8 @@ async def callbacks(update,context):
         await q.edit_message_text(f'👑 הקבוצה {get_group(cid)["title"]}: {"מאושרת" if value=="1" else "לא מאושרת"}')
         return
     g=get_group(cid)
-    if not g:
-        await q.answer('הקבוצה לא רשומה. שלח /register בקבוצה ואז אשר אותה בפרטי.',show_alert=True);return
+    if not g or not g.get('active',1):
+        await q.answer('הקבוצה לא פעילה כרגע. שלח /register בקבוצה כדי לרשום אותה.',show_alert=True);return
     if not g['approved'] and uid!=OWNER:
         await q.answer('הקבוצה ממתינה לאישור בעל הבוט.',show_alert=True);return
     if action=='verify':
@@ -459,6 +478,8 @@ async def callbacks(update,context):
         if q.message.chat.type!='private':
             await q.answer('עריכת הגדרות בפרטי בלבד',show_alert=True);return
         PENDING[uid]=(cid,value)
+        with conn() as c:
+            c.execute('INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,?,?)',(uid,cid,value));c.commit()
         await q.answer()
         await context.bot.send_message(uid,f'✏️ הגדרה: {value}\nשלח את הערך החדש בהודעה הבאה בפרטי.\nלכפתורים: שורה לכל כפתור בפורמט: כותרת | https://example.com\nלמילים אסורות: רשימה מופרדת בפסיקים.\nלתגובה חדשה: טריגר | exact/contains | טקסט\nלהודעה חוזרת: דקות | טקסט\nשלח /cancel לביטול.')
         return
@@ -476,12 +497,16 @@ async def callbacks(update,context):
         try:key,index=value.split(',');index=int(index);assert key in ('replies','announcements');cfg(cid)[key][index]
         except Exception:await q.answer('לא נמצא');return
         PENDING[uid]=(cid,f'{action}:{key}:{index}')
+        with conn() as c:
+            c.execute('INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,?,?)',(uid,cid,f'{action}:{key}:{index}'));c.commit()
         await q.answer()
         await context.bot.send_message(uid,'🔘 שלח כפתורים בשורות: כותרת | https://example.com\nאו שלח תמונה/וידאו. כתוב מחק להסרת מדיה/כפתורים.');return
     if action=='itemedit':
         try:key,index=value.split(',');index=int(index);item=cfg(cid)[key][index]
         except Exception:await q.answer('לא נמצא');return
         PENDING[uid]=(cid,f'item:{key}:{index}')
+        with conn() as c:
+            c.execute('INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,?,?)',(uid,cid,f'item:{key}:{index}'));c.commit()
         await q.answer();await context.bot.send_message(uid,'✏️ שלח הגדרה חדשה:\nלתגובה: טריגר | exact/contains | טקסט\nלהודעה חוזרת: דקות | טקסט\nהעיצוב של טלגרם נשמר בהודעות טקסט.');return
     if action=='remove':
         try:key,index=value.split(',');index=int(index);data=cfg(cid)[key];data.pop(index);set_cfg(cid,key,data)
@@ -512,13 +537,41 @@ async def callbacks(update,context):
     await q.answer()
 
 
+def clear_pending(uid):
+    PENDING.pop(uid,None)
+    with conn() as c:
+        c.execute('DELETE FROM pending_edits WHERE uid=?',(uid,));c.commit()
+
+
 async def input_private(update,context):
     if update.effective_chat.type!='private':return
     uid=update.effective_user.id
-    pending=PENDING.pop(uid,None)
-    if not pending:return
+    # Read from the database first: in-memory state is lost on deployment.
+    with conn() as c:
+        r=c.execute('SELECT chat,field FROM pending_edits WHERE uid=?',(uid,)).fetchone()
+    pending=(r['chat'],r['field']) if r else PENDING.get(uid)
+    log.info('Private input from user %s: pending field=%s',uid,pending[1] if pending else None)
+    if not pending:
+        if uid==OWNER:
+            await update.message.reply_text('ℹ️ אין כרגע הגדרה שממתינה לערך. בחר הגדרה בתפריט, או שלח /setstart כדי לשנות את הודעת הפתיחה.')
+        return
     cid,key=pending
-    if not await authorized(context.bot,uid,cid) or not get_group(cid)['approved']:return
+    if key=='owner_start_text':
+        if uid!=OWNER:return
+        value=(update.message.text or update.message.caption or '').strip()
+        if not value or len(value)>3500:
+            await update.message.reply_text('❌ שלח טקסט באורך 1–3500 תווים. ההגדרה עדיין ממתינה.')
+            return
+        with conn() as c:
+            c.execute("INSERT OR REPLACE INTO meta(key,val) VALUES ('regular_start_text',?)",(value,))
+            c.execute('DELETE FROM pending_edits WHERE uid=?',(uid,));c.commit()
+        PENDING.pop(uid,None)
+        await update.message.reply_text('✅ הודעת הפתיחה למשתמשים נשמרה!')
+        return
+    group=get_group(cid)
+    if not group or not group.get('active',1) or (uid!=OWNER and (not group['approved'] or not await authorized(context.bot,uid,cid))):
+        await update.message.reply_text('❌ אין גישה לקבוצה הזאת כרגע.')
+        return
     raw=update.message.text or update.message.caption or ''
     d=cfg(cid)
     try:
@@ -555,7 +608,7 @@ async def input_private(update,context):
                 elif raw.strip() in ('מחק','remove'):val=None
                 else:raise ValueError()
                 d[kind][index]['media']=val
-            save_cfg(cid,d);await update.message.reply_text('✅ נשמר');return
+            save_cfg(cid,d);clear_pending(uid);await update.message.reply_text('✅ נשמר');return
         elif key.startswith('item:'):
             _,kind,index=key.split(':');index=int(index)
             if kind=='replies':
@@ -565,25 +618,28 @@ async def input_private(update,context):
             elif kind=='announcements':
                 minutes,response=raw.split('|',1);minutes=int(minutes);assert minutes>0
                 d[kind][index].update(minutes=minutes,text=response.strip(),last=int(time.time()))
-            save_cfg(cid,d);await update.message.reply_text('✅ נערך בהצלחה');return
+            save_cfg(cid,d);clear_pending(uid);await update.message.reply_text('✅ נערך בהצלחה');return
         elif key=='add_reply':
             trigger,mode,response=[x.strip() for x in raw.split('|',2)]
             assert mode in ('exact','contains') and trigger and response
             d['replies'].append({'trigger':trigger,'mode':mode,'text':response,'buttons':[]});save_cfg(cid,d)
-            await update.message.reply_text('✅ התגובה נוספה');return
+            clear_pending(uid);await update.message.reply_text('✅ התגובה נוספה');return
         elif key=='add_announcement':
             minutes,response=raw.split('|',1);minutes=int(minutes.strip());assert minutes>=1
             d['announcements'].append({'minutes':minutes,'text':response.strip(),'last':int(time.time())});save_cfg(cid,d)
-            await update.message.reply_text('✅ ההודעה החוזרת נוספה');return
+            clear_pending(uid);await update.message.reply_text('✅ ההודעה החוזרת נוספה');return
         else:val='HTML:'+update.message.text_html if update.message.text and update.message.entities else raw
         set_cfg(cid,key,val)
+        clear_pending(uid)
         await update.message.reply_text('✅ נשמר בהצלחה!')
     except Exception:
-        await update.message.reply_text('❌ פורמט לא תקין. היכנס שוב להגדרה ונסה מחדש.')
+        log.exception('Private input validation failed for field %s',key)
+        await update.message.reply_text('❌ פורמט לא תקין. ההגדרה עדיין ממתינה — שלח ערך תקין או /cancel.')
 
 
 async def cancel(update,context):
     PENDING.pop(update.effective_user.id,None)
+    clear_pending(update.effective_user.id)
     await update.message.reply_text('בוטל.')
 
 
@@ -665,7 +721,9 @@ async def moderate(update,context):
     msg=update.effective_message;cid=msg.chat_id;g=get_group(cid)
     if not g or not g['approved']:return
     if msg.sender_chat and cfg(cid)['channel_posts_delete']:
-        if msg.sender_chat.type=='channel':
+        # Telegram represents channel posts and anonymous/group-as-chat messages via sender_chat.
+        # Only delete channel identities, not anonymous administrators posting as the group itself.
+        if msg.sender_chat.type=='channel' and msg.sender_chat.id != cid:
             await safe_delete(context.bot,cid,msg.message_id)
             return
     if not msg.from_user:return
@@ -741,7 +799,8 @@ async def commands(update,context):
         return
     if not target:return
     if target.id==OWNER or await authorized(context.bot,target.id,cid):return
-    await safe_delete(context.bot,cid,msg.reply_to_message.message_id)
+    if cmd in ('warn','mute','ban'):
+        await safe_delete(context.bot,cid,msg.reply_to_message.message_id)
     if cmd=='warn':await warning(context.bot,cid,target,' '.join(args))
     elif cmd=='warnings':
         n=warn_count(cid,target.id)
@@ -884,6 +943,14 @@ async def periodic(context):
         if changed:save_cfg(cid,d)
 
 
+
+async def status_cmd(update,context):
+    if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:return
+    groups=all_groups()
+    with conn() as c:
+        all_count=c.execute('SELECT COUNT(*) FROM groups').fetchone()[0]
+    await update.message.reply_text(f'🩺 CINEMIX מצב מערכת\nקבוצות פעילות: {len(groups)}\nמאושרות ופעילות: {sum(bool(g["approved"]) for g in groups)}\nרשומות כולל קבוצות שהוסרו: {all_count}\nמסד נתונים: {DB}\n\nשים לב: אם מסד הנתונים אינו על דיסק קבוע, הנתונים עלולים להימחק בפריסה מחדש.')
+
 async def private_document(update,context):
     # Document import is only accepted by replying /import in the target group.
     return
@@ -902,6 +969,7 @@ def main():
     app.add_handler(CommandHandler('admin',owner_panel))
     app.add_handler(CommandHandler('setstart',set_start_text))
     app.add_handler(CommandHandler('showstart',show_start_text))
+    app.add_handler(CommandHandler('status',status_cmd))
     app.add_handler(CommandHandler('manage',manage))
     app.add_handler(CommandHandler('register',register_group))
     app.add_handler(CommandHandler('groups',groups_cmd))

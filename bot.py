@@ -212,13 +212,46 @@ async def notify_owner(bot,cid):
 
 async def my_member(update,context):
     ev=update.my_chat_member
-    if not ev or ev.chat.type not in ('group','supergroup'):return
-    if ev.new_chat_member.status in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR):
+    if not ev or ev.chat.type not in ('group','supergroup'):
+        return
+    before=ev.old_chat_member.status
+    after=ev.new_chat_member.status
+    active=(ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
+    if after in active:
         old=get_group(ev.chat.id)
         upsert(ev.chat.id,ev.chat.title or str(ev.chat.id))
-        if not old:await notify_owner(context.bot,ev.chat.id)
-    elif ev.new_chat_member.status in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED):
-        with conn() as c:c.execute('DELETE FROM groups WHERE id=?',(ev.chat.id,));c.commit()
+        if not old:
+            await notify_owner(context.bot,ev.chat.id)
+    elif after in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED) and before in active:
+        # A removal is NOT a request for approval. Do not re-register it from service messages.
+        with conn() as c:
+            c.execute('DELETE FROM groups WHERE id=?',(ev.chat.id,))
+            c.commit()
+        log.info('Bot removed from group %s',ev.chat.id)
+
+
+async def ensure_group(bot,chat,notify=True):
+    """Recover a missing group row only when Telegram confirms this bot is present."""
+    if chat.type not in ('group','supergroup'):
+        return False
+    existing=get_group(chat.id)
+    if existing:
+        if chat.title and existing['title'] != chat.title:
+            upsert(chat.id,chat.title)
+        return True
+    try:
+        me=await bot.get_me()
+        membership=await bot.get_chat_member(chat.id,me.id)
+        if membership.status not in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER):
+            return False
+    except TelegramError as e:
+        log.warning('Cannot confirm membership in %s: %s',chat.id,e)
+        return False
+    upsert(chat.id,chat.title or str(chat.id))
+    log.info('Recovered missing group %s',chat.id)
+    if notify:
+        await notify_owner(bot,chat.id)
+    return True
 
 
 def menu(cid):
@@ -239,7 +272,7 @@ async def list_groups(bot,uid,cid):
     for g in all_groups():
         if uid==OWNER or (g['approved'] and await authorized(bot,uid,g['id'])):groups.append(g)
     if not groups:
-        await bot.send_message(cid,'אין כרגע קבוצות זמינות לניהול.');return
+        await bot.send_message(cid,('אין קבוצות רשומות כרגע. אם הבוט כבר מנהל קבוצה, שלח בה /register כדי לרשום אותה מחדש.' if uid==OWNER else 'אין כרגע קבוצות מאושרות שאתה מנהל.'));return
     for g in groups:
         title=g['title'][:50]
         text=f'👥 {title}\nסטטוס: {"מאושרת" if g["approved"] else "ממתינה לאישור"}'
@@ -257,7 +290,7 @@ def regular_start_text():
 async def owner_panel(update,context):
     if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:
         return
-    await update.message.reply_text('👑 פאנל הבעלים של CINEMIX\n/groups — כל הקבוצות\n/setstart טקסט — שינוי הודעת הפתיחה\n/showstart — הצגת הודעת הפתיחה',reply_markup=kb([('👥 כל הקבוצות','list:all:0')],[('📖 מדריך','guide:all:0')]))
+    await update.message.reply_text('👑 פאנל הבעלים של CINEMIX\n/groups — כל הקבוצות\n/setstart טקסט — שינוי הודעת הפתיחה\n/showstart — הצגת הודעת הפתיחה\n\nאם קבוצה חסרה אחרי פריסה, שלח בה /register פעם אחת. אישור נדרש רק לקבוצה חדשה.',reply_markup=kb([('👥 כל הקבוצות','list:all:0')],[('📖 מדריך','guide:all:0')]))
     await list_groups(context.bot,OWNER,update.effective_chat.id)
 
 
@@ -292,9 +325,8 @@ async def manage(update,context):
     chat=update.effective_chat;uid=update.effective_user.id
     if chat.type!='private':
         await safe_delete(context.bot,chat.id,update.message.message_id)
-        if not get_group(chat.id):
-            upsert(chat.id,chat.title or str(chat.id))
-            await notify_owner(context.bot,chat.id)
+        if not await ensure_group(context.bot,chat):
+            return
         if not await authorized(context.bot,uid,chat.id):return
         try:await context.bot.send_message(uid,'⚙️ ניהול קבוצות:',reply_markup=kb([('👥 בחר קבוצה','list:all:0')]))
         except TelegramError:
@@ -309,18 +341,15 @@ async def groups_cmd(update,context):
 
 
 async def track_group(update,context):
-    """Re-discover groups from any incoming update, including commands and service messages.
-    Never grant approval merely because the group was discovered.
-    """
     chat=update.effective_chat
     if not chat or chat.type not in ('group','supergroup'):
         return
-    if not get_group(chat.id):
-        upsert(chat.id,chat.title or str(chat.id))
-        log.info('Registered group %s (%s) from update',chat.id,chat.title)
-        await notify_owner(context.bot,chat.id)
-    elif chat.title and get_group(chat.id)['title']!=chat.title:
-        upsert(chat.id,chat.title)
+    # Membership transitions are handled exclusively by MY_CHAT_MEMBER.
+    # A left_chat_member service message must never create a new approval request.
+    msg=update.effective_message
+    if msg and (msg.left_chat_member or msg.new_chat_members):
+        return
+    await ensure_group(context.bot,chat)
 
 
 async def register_group(update,context):
@@ -332,11 +361,9 @@ async def register_group(update,context):
     if not user or not await authorized(context.bot,user.id,chat.id):
         return
     await safe_delete(context.bot,chat.id,update.message.message_id)
+    if not await ensure_group(context.bot,chat):
+        return
     g=get_group(chat.id)
-    if not g:
-        upsert(chat.id,chat.title or str(chat.id))
-        await notify_owner(context.bot,chat.id)
-        g=get_group(chat.id)
     await context.bot.send_message(chat.id,
         '✅ הקבוצה נרשמה במערכת. ' + ('הקבוצה מאושרת.' if g['approved'] else 'ממתינה לאישור בעל הבוט.'))
 
@@ -397,8 +424,8 @@ async def callbacks(update,context):
     g=get_group(cid)
     if not g:
         await q.answer('הקבוצה לא רשומה. שלח /register בקבוצה ואז אשר אותה בפרטי.',show_alert=True);return
-    if not g['approved']:
-        await q.answer('הקבוצה ממתינה לאישור. פתח /admin ואשר אותה.',show_alert=True);return
+    if not g['approved'] and uid!=OWNER:
+        await q.answer('הקבוצה ממתינה לאישור בעל הבוט.',show_alert=True);return
     if action=='verify':
         if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
         with conn() as c:
@@ -638,7 +665,7 @@ async def moderate(update,context):
     msg=update.effective_message;cid=msg.chat_id;g=get_group(cid)
     if not g or not g['approved']:return
     if msg.sender_chat and cfg(cid)['channel_posts_delete']:
-        if msg.sender_chat.type=='channel' and msg.sender_chat.id!=cid:
+        if msg.sender_chat.type=='channel':
             await safe_delete(context.bot,cid,msg.message_id)
             return
     if not msg.from_user:return

@@ -91,8 +91,35 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS welcomes (chat INTEGER PRIMARY KEY, mid INTEGER, expires INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS mutes (chat INTEGER, uid INTEGER, original TEXT, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_edits (uid INTEGER PRIMARY KEY, chat INTEGER, field TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS invitations (chat INTEGER PRIMARY KEY, inviter INTEGER)')
+    c.execute('CREATE TABLE IF NOT EXISTS stats (chat INTEGER, kind TEXT, amount INTEGER DEFAULT 0, PRIMARY KEY(chat,kind))')
+    c.execute('CREATE TABLE IF NOT EXISTS drafts (uid INTEGER PRIMARY KEY, chat INTEGER, kind TEXT, payload TEXT)')
     c.commit()
     return c
+
+
+def metric(cid,kind,n=1):
+    with conn() as c:
+        c.execute('INSERT INTO stats(chat,kind,amount) VALUES (?,?,?) ON CONFLICT(chat,kind) DO UPDATE SET amount=amount+excluded.amount',(cid,kind,n))
+        c.commit()
+
+
+def draft_set(uid,cid,kind,payload):
+    with conn() as c:
+        c.execute('INSERT OR REPLACE INTO drafts(uid,chat,kind,payload) VALUES (?,?,?,?)',(uid,cid,kind,json.dumps(payload,ensure_ascii=False)));c.commit()
+
+
+def draft_get(uid):
+    with conn() as c:r=c.execute('SELECT * FROM drafts WHERE uid=?',(uid,)).fetchone()
+    return (r['chat'],r['kind'],json.loads(r['payload'])) if r else None
+
+
+def draft_clear(uid):
+    with conn() as c:c.execute('DELETE FROM drafts WHERE uid=?',(uid,));c.commit()
+
+
+def pending_set(uid,cid,key):
+    with conn() as c:c.execute('INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,?,?)',(uid,cid,key));c.commit()
 
 
 def get_group(cid):
@@ -221,10 +248,15 @@ async def my_member(update,context):
     after=ev.new_chat_member.status
     active=(ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
     if after in active:
+        if before not in active and ev.from_user:
+            with conn() as c:
+                c.execute('INSERT OR REPLACE INTO invitations(chat,inviter) VALUES (?,?)',(ev.chat.id,ev.from_user.id));c.commit()
         old=get_group(ev.chat.id)
         upsert(ev.chat.id,ev.chat.title or str(ev.chat.id))
         if not old:
             await notify_owner(context.bot,ev.chat.id)
+            try:await context.bot.send_message(ev.chat.id,'⏳ הבוט ממתין לאישור בעל המערכת. עד האישור לא יפעלו הגדרות ניהול.')
+            except TelegramError:pass
     elif after in (ChatMemberStatus.LEFT,ChatMemberStatus.BANNED) and before in active:
         # Preserve approval and settings across a temporary removal or restart.
         set_group(ev.chat.id, active=0)
@@ -275,6 +307,8 @@ def menu(cid):
               [('🤖 תגובות',f'page:replies:{cid}'),('📢 הודעות חוזרות',f'page:announcements:{cid}')],
               [('🛡️ מורשים',f'page:allowlist:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
               [('📦 גיבוי',f'page:backup:{cid}'),('🗑️ הודעות שירות',f'page:service:{cid}')],
+              [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
+              [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('👑 פאנל בעלים',f'ownerall:x:{cid}')],
               [('📖 מדריך',f'page:guide:{cid}'),('⬅️ קבוצות',f'list:all:0')])
 
 
@@ -385,6 +419,16 @@ async def register_group(update,context):
         '✅ הקבוצה נרשמה במערכת. ' + ('הקבוצה מאושרת.' if g['approved'] else 'ממתינה לאישור בעל הבוט.'))
 
 
+def broadcast_picker(payload):
+    rows=[]
+    for group in all_groups():
+        if group['approved']:
+            selected=group['id'] in payload.get('targets',[])
+            rows.append([(('☑️ ' if selected else '⬜ ')+group['title'][:35],f'broadcastpick:{group["id"]}:{payload["source"]}')])
+    rows.append([('✅ סיום בחירה',f'broadcastpick:done:{payload["source"]}')])
+    return kb(*rows)
+
+
 def page_keyboard(cid,page):
     d=cfg(cid)
     toggles={'links':'links','welcome':'welcome','flood':'flood','verify':'verify','service':'service_delete','calendar':'shabbat','channels':'channel_posts_delete'}
@@ -413,8 +457,8 @@ def page_keyboard(cid,page):
                      [('⏱️ דקות אחרי צאת',f'edit:end_offset:{cid}')],
                      [('🌇 דקות אחרי שקיעה לצאת משוער',f'edit:nightfall_minutes:{cid}')]])
         for key,label in [('shabbat_lock_text','הודעת כניסת שבת'),('shabbat_unlock_text','הודעת צאת שבת'),('holiday_lock_text','הודעת כניסת חג'),('holiday_unlock_text','הודעת צאת חג')]:rows.append([(label,f'edit:{key}:{cid}')])
-    if page=='replies':rows.extend([[('➕ הוספת תגובה',f'edit:add_reply:{cid}')],[('📋 רשימת תגובות / עריכה / מחיקה',f'show:replies:{cid}')]])
-    if page=='announcements':rows.extend([[('➕ הוספת הודעה חוזרת',f'edit:add_announcement:{cid}')],[('📋 רשימה / עריכה / מחיקה',f'show:announcements:{cid}')]])
+    if page=='replies':rows.extend([[('➕ הוספת תגובה מודרכת',f'wiz:reply:{cid}')],[('📋 רשימת תגובות / עריכה / מחיקה',f'show:replies:{cid}')]])
+    if page=='announcements':rows.extend([[('➕ פרסום אוטומטי מודרך',f'wiz:announcement:{cid}')],[('📋 רשימה / עריכה / מחיקה',f'show:announcements:{cid}')]])
     if page=='allowlist':rows.append([('📋 רשימת מורשים',f'show:allowlist:{cid}')])
     if page=='backup':
         rows.append([('📤 ייצוא הגדרות',f'export:x:{cid}')])
@@ -438,6 +482,13 @@ async def callbacks(update,context):
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
         if not get_group(cid):await q.answer('קבוצה לא נמצאה');return
         set_group(cid,approved=int(value));await q.answer('עודכן')
+        decision='✅ הקבוצה אושרה להפעלת CINEMIX. מנהלי הקבוצה יכולים כעת לפתוח ניהול בפרטי.' if value=='1' else '❌ הקבוצה לא אושרה לשימוש ב-CINEMIX. הבוט לא יבצע פעולות ניהול בקבוצה.'
+        try:await context.bot.send_message(cid,decision)
+        except TelegramError:log.warning('Cannot announce approval in %s',cid)
+        with conn() as c:inv=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
+        if inv:
+            try:await context.bot.send_message(inv['inviter'],f'{decision}\nקבוצה: {get_group(cid)["title"]}')
+            except TelegramError:log.info('Inviter %s has not started private bot chat',inv['inviter'])
         await q.edit_message_text(f'👑 הקבוצה {get_group(cid)["title"]}: {"מאושרת" if value=="1" else "לא מאושרת"}')
         return
     g=get_group(cid)
@@ -459,6 +510,147 @@ async def callbacks(update,context):
         return
     if not await authorized(context.bot,uid,cid):
         await q.answer('אין הרשאה',show_alert=True);return
+    if action=='wiz':
+        if q.message.chat.type!='private':await q.answer('רק בפרטי',show_alert=True);return
+        await q.answer()
+        if value=='reply':
+            draft_set(uid,cid,'reply',{})
+            pending_set(uid,cid,'wizard:reply:trigger')
+            await q.message.reply_text('🤖 יצירת תגובה אוטומטית\nשלב 1/5: איזו מילה או ביטוי יפעילו את התגובה?')
+        elif value=='announcement':
+            draft_set(uid,cid,'announcement',{})
+            pending_set(uid,cid,'wizard:announcement:minutes')
+            await q.message.reply_text('⏰ פרסום אוטומטי\nשלב 1/4: כל כמה דקות לפרסם? לדוגמה 180 לפרסום כל 3 שעות.')
+        elif value=='broadcast':
+            draft_set(uid,cid,'broadcast',{'source':cid})
+            pending_set(uid,cid,'wizard:broadcast:text')
+            await q.message.reply_text('📣 פרסום חד־פעמי\nשלח טקסט, תמונה עם כיתוב או סרטון עם כיתוב. בהמשך תבחר יעד ותאשר.')
+        return
+    if action=='wizardmode':
+        d=draft_get(uid)
+        if not d or d[0]!=cid or d[1]!='reply':await q.answer('ההגדרה פגה');return
+        payload=d[2];payload['mode']=value;draft_set(uid,cid,'reply',payload)
+        pending_set(uid,cid,'wizard:reply:text')
+        await q.answer();await q.message.reply_text('שלב 3/5: מה הבוט יענה? שלח טקסט.')
+        return
+    if action=='wizardbool':
+        d=draft_get(uid)
+        if not d or d[0]!=cid:await q.answer('ההגדרה פגה');return
+        payload=d[2]
+        if d[1]=='reply':
+            if value=='buttons':
+                if payload.get('buttons_choice') is None:
+                    payload['buttons_choice']=True;draft_set(uid,cid,'reply',payload);pending_set(uid,cid,'wizard:reply:buttons')
+                    await q.answer();await q.message.reply_text('שלב 4/5: שלח כפתורים, כל שורה: כותרת | https://example.com. שלח /skip לדלג.')
+                    return
+            if value=='nobuttons':payload['buttons']=[]
+            draft_set(uid,cid,'reply',payload)
+            pending_set(uid,cid,'wizard:reply:media')
+            await q.answer();await q.message.reply_text('שלב 5/5: שלח תמונה או סרטון לתגובה, או /skip לדלג.')
+            return
+        if d[1]=='announcement':
+            payload['delete_previous']=(value=='deleteyes')
+            draft_set(uid,cid,'announcement',payload)
+            pending_set(uid,cid,'wizard:announcement:buttons')
+            await q.answer();await q.message.reply_text('שלב 4/4: כפתורים בפורמט כותרת | קישור, או /skip לדלג. לאחר מכן תראה תצוגה מקדימה.')
+            return
+    if action=='wizardpreview' and value=='cancel':
+        draft_clear(uid);clear_pending(uid);await q.answer('בוטל');await q.message.reply_text('❌ הפרסום בוטל');return
+    if action=='wizardpreview':
+        d=draft_get(uid)
+        if not d or d[0]!=cid:await q.answer('אין טיוטה');return
+        await q.answer()
+        payload=d[2]
+        if value=='save' and d[1] in ('reply','announcement'):
+            data=cfg(cid);kind='replies' if d[1]=='reply' else 'announcements'
+            payload.pop('buttons_choice',None)
+            if kind=='announcements':payload['last']=int(time.time());payload['last_mid']=None
+            data[kind].append(payload);save_cfg(cid,data);draft_clear(uid);clear_pending(uid)
+            await q.message.reply_text('✅ נשמר בהצלחה!');return
+        if value=='send' and d[1]=='broadcast':
+            targets=payload.get('targets',[])
+            sent=0;failed=[]
+            for target in targets:
+                g2=get_group(target)
+                if not g2 or not g2['approved'] or not g2['active']:continue
+                if uid!=OWNER and not await authorized(context.bot,uid,target):continue
+                try:
+                    await send_formatted(context.bot,target,payload['text'],markup=buttons(payload.get('buttons')),media=payload.get('media'))
+                    sent+=1;metric(target,'broadcasts')
+                except TelegramError as e:failed.append(f'{g2["title"]}: {str(e)[:70]}')
+                await asyncio.sleep(0.12)
+            draft_clear(uid);clear_pending(uid)
+            await q.message.reply_text(f'📣 הפרסום הסתיים. הצלחות: {sent}; כישלונות: {len(failed)}'+('\n'+'\n'.join(failed[:12]) if failed else ''))
+            return
+    if action=='broadcastpick':
+        if uid!=OWNER:await q.answer('רק בעל הבוט');return
+        d=draft_get(uid)
+        if not d or d[1]!='broadcast':await q.answer('אין טיוטה');return
+        payload=d[2];targets=payload.get('targets',[])
+        if value=='done':
+            if not targets:await q.answer('בחר לפחות קבוצה אחת',show_alert=True);return
+            await q.answer();await q.message.reply_text(f'📣 תצוגה מקדימה\n\n{payload.get("text","")[:1200]}\n\nיעדים: {len(targets)}\nלא נשלח עדיין.',reply_markup=kb([('✅ אשר ושלח',f'wizardpreview:send:{cid}'),('❌ בטל',f'wizardpreview:cancel:{cid}')]))
+            return
+        try:chosen=int(value)
+        except ValueError:await q.answer('שגיאה');return
+        g2=get_group(chosen)
+        if not g2 or not g2['approved'] or not g2['active']:await q.answer('הקבוצה אינה מאושרת');return
+        if chosen in targets:targets.remove(chosen)
+        else:targets.append(chosen)
+        payload['targets']=targets;draft_set(uid,cid,'broadcast',payload)
+        await q.answer('עודכן')
+        await q.edit_message_reply_markup(broadcast_picker(payload))
+        return
+    if action=='broadcasttarget' and value=='choose':
+        if uid!=OWNER:await q.answer('רק בעל הבוט');return
+        await q.answer();await q.message.reply_text('📍 בחר קבוצות לפרסום ואז לחץ סיום:',reply_markup=broadcast_picker(draft_get(uid)[2]))
+        return
+    if action=='broadcasttarget':
+        d=draft_get(uid)
+        if not d or d[1]!='broadcast':await q.answer('אין טיוטה');return
+        payload=d[2]
+        if value=='all' and uid==OWNER:targets=[g2['id'] for g2 in all_groups() if g2['approved']]
+        elif value=='one':targets=[cid]
+        else:await q.answer('אין הרשאה');return
+        payload['targets']=targets;draft_set(uid,cid,'broadcast',payload)
+        await q.answer();await q.message.reply_text(f'📣 תצוגה מקדימה\n\n{payload.get("text","")[:1200]}\n\nיעדים: {len(targets)}\nלא נשלח עדיין.',reply_markup=kb([('✅ אשר ושלח',f'wizardpreview:send:{cid}'),('❌ בטל',f'wizardpreview:cancel:{cid}')]))
+        return
+    if action=='ownerall':
+        if uid!=OWNER:await q.answer('רק בעל הבוט');return
+        await q.answer()
+        groups=[g2 for g2 in all_groups() if g2['approved']]
+        await q.message.reply_text('👑 פאנל בעלים\n'+'\n'.join(f'{g2["title"]} | {g2["id"]}' for g2 in groups)[:3300]+f'\n\nקבוצות מאושרות: {len(groups)}',reply_markup=kb([('📣 פרסום לכל הקבוצות',f'wiz:broadcast:{cid}')]))
+        return
+    if action=='health':
+        await q.answer()
+        try:
+            me=await context.bot.get_me();member=await context.bot.get_chat_member(cid,me.id)
+            checks=[('מנהל',member.status=='administrator'),('מחיקת הודעות',bool(getattr(member,'can_delete_messages',False))),('חסימה/השתקה',bool(getattr(member,'can_restrict_members',False))),('נעיצת הודעות',bool(getattr(member,'can_pin_messages',False)))]
+            await q.message.reply_text('🩺 בדיקת הרשאות\n'+'\n'.join(('✅ ' if ok else '❌ ')+name for name,ok in checks))
+        except TelegramError as e:await q.message.reply_text(f'❌ בדיקה נכשלה: {e}')
+        return
+    if action=='stats':
+        await q.answer()
+        with conn() as c:rows=c.execute('SELECT kind,amount FROM stats WHERE chat=?',(cid,)).fetchall()
+        await q.message.reply_text('📊 סטטיסטיקות קבוצה\n'+('\n'.join(f'{r["kind"]}: {r["amount"]}' for r in rows) if rows else 'אין נתונים עדיין.'))
+        return
+    if action in ('annswitch','annshabbat','annhours'):
+        try:index=int(value);item=cfg(cid)['announcements'][index]
+        except (ValueError,IndexError):await q.answer('לא נמצא');return
+        if action=='annhours':
+            pending_set(uid,cid,f'annhours:{index}')
+            await q.answer();await q.message.reply_text('🕐 שלח טווח שעות לדוגמה 09:00-23:00, או מחק כדי לפרסם בכל שעה.');return
+        field='enabled' if action=='annswitch' else 'skip_shabbat_holiday'
+        item[field]=not item.get(field,field=='enabled')
+        d=cfg(cid);d['announcements'][index]=item;save_cfg(cid,d)
+        await q.answer('עודכן');await q.message.reply_text(f'✅ {field}: {item[field]}');return
+    if action=='annprev':
+        try:index=int(value);item=cfg(cid)['announcements'][index]
+        except (ValueError,IndexError):await q.answer('לא נמצא');return
+        item['delete_previous']=not item.get('delete_previous',False)
+        d=cfg(cid);d['announcements'][index]=item;save_cfg(cid,d)
+        await q.answer('עודכן');await q.message.reply_text('🗑️ מחיקת פרסום קודם: '+('כן' if item['delete_previous'] else 'לא'))
+        return
     if action=='open':
         await q.answer();await q.message.reply_text(f'⚙️ {g["title"]}\nבחר הגדרה:',reply_markup=menu(cid));return
     if action=='page':
@@ -491,6 +683,10 @@ async def callbacks(update,context):
             if value in ('replies','announcements'):
                 actions.append([('✏️ ערוך טקסט',f'itemedit:{value},{i}:{cid}')])
                 actions.append([('🔘 כפתורים',f'itembuttons:{value},{i}:{cid}'),('🖼️ מדיה',f'itemmedia:{value},{i}:{cid}')])
+                if value=='announcements':
+                    actions.append([('🗑️ מחיקת קודם: '+('כן' if item.get('delete_previous') else 'לא'),f'annprev:{i}:{cid}')])
+                    actions.append([('⏸️ השבת/הפעל',f'annswitch:{i}:{cid}'),('🕯️ שבת וחג',f'annshabbat:{i}:{cid}')])
+                    actions.append([('🕐 שעות פעילות',f'annhours:{i}:{cid}')])
             await q.message.reply_text(f'{i+1}. {str(item)[:250]}',reply_markup=kb(*actions) if value!='allowlist' else None)
         return
     if action in ('itembuttons','itemmedia'):
@@ -556,6 +752,24 @@ async def input_private(update,context):
             await update.message.reply_text('ℹ️ אין כרגע הגדרה שממתינה לערך. בחר הגדרה בתפריט, או שלח /setstart כדי לשנות את הודעת הפתיחה.')
         return
     cid,key=pending
+    if key.startswith('wizard:'):
+        await wizard_input(update,context,cid,key)
+        return
+    if key.startswith('annhours:'):
+        group=get_group(cid)
+        if not group or not group['approved'] or (uid!=OWNER and not await authorized(context.bot,uid,cid)):
+            clear_pending(uid);return
+        try:
+            index=int(key.split(':')[1]);raw=(update.message.text or '').strip()
+            if raw=='מחק':hours=None
+            else:
+                m=re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d',raw)
+                if not m:raise ValueError()
+                hours=[x.strip() for x in raw.split('-')]
+            d=cfg(cid);d['announcements'][index]['active_hours']=hours;save_cfg(cid,d);clear_pending(uid)
+            await update.message.reply_text('✅ שעות הפעילות נשמרו')
+        except (ValueError,IndexError,KeyError):await update.message.reply_text('❌ שלח 09:00-23:00 או מחק')
+        return
     if key=='owner_start_text':
         if uid!=OWNER:return
         value=(update.message.text or update.message.caption or '').strip()
@@ -637,8 +851,112 @@ async def input_private(update,context):
         await update.message.reply_text('❌ פורמט לא תקין. ההגדרה עדיין ממתינה — שלח ערך תקין או /cancel.')
 
 
+def parse_url_buttons(raw):
+    result=[]
+    for line in raw.splitlines():
+        if not line.strip():continue
+        title,url=[x.strip() for x in line.split('|',1)]
+        if not title or not url.startswith(('https://','http://','tg://')):raise ValueError('קישור לא תקין')
+        result.append({'text':title,'url':url})
+    return result
+
+
+async def wizard_preview(update,context,cid,kind,payload):
+    if kind=='reply':
+        desc=f'🤖 תצוגה מקדימה\nטריגר: {payload["trigger"]}\nהתאמה: {payload["mode"]}\nתגובה: {payload["text"]}\nכפתורים: {len(payload.get("buttons",[]))}\nמדיה: {"כן" if payload.get("media") else "לא"}'
+    else:
+        desc=f'⏰ תצוגה מקדימה\nכל {payload["minutes"]} דקות\n{payload["text"]}\nמחיקת הקודם: {"כן" if payload.get("delete_previous") else "לא"}\nכפתורים: {len(payload.get("buttons",[]))}'
+    await update.message.reply_text(desc,reply_markup=kb([('✅ שמור',f'wizardpreview:save:{cid}'),('❌ בטל',f'wizardpreview:cancel:{cid}')]))
+    try:
+        await send_formatted(context.bot,update.effective_user.id,payload['text'],markup=buttons(payload.get('buttons')),media=payload.get('media'))
+    except TelegramError:
+        log.warning('Preview could not be delivered to user %s',update.effective_user.id)
+
+
+async def wizard_input(update,context,cid,key):
+    uid=update.effective_user.id
+    d=draft_get(uid)
+    if not d or d[0]!=cid:clear_pending(uid);await update.message.reply_text('❌ הטיוטה לא נמצאה, התחל מחדש.');return
+    _,kind,payload=d
+    if uid!=OWNER:
+        g=get_group(cid)
+        if not g or not g['approved'] or not await authorized(context.bot,uid,cid):clear_pending(uid);draft_clear(uid);return
+    step=key.split(':')[-1]
+    raw=(update.message.text or update.message.caption or '').strip()
+    try:
+        if kind=='reply':
+            if step=='trigger':
+                if not raw or len(raw)>120:raise ValueError()
+                payload['trigger']=raw;draft_set(uid,cid,kind,payload);clear_pending(uid)
+                await update.message.reply_text('שלב 2/5: מתי להגיב?',reply_markup=kb([('🎯 בדיוק הביטוי',f'wizardmode:exact:{cid}'),('🔎 גם בתוך משפט',f'wizardmode:contains:{cid}')]))
+                return
+            if step=='text':
+                if not raw:raise ValueError()
+                payload['text']=raw;draft_set(uid,cid,kind,payload);clear_pending(uid)
+                await update.message.reply_text('שלב 4/5: להוסיף כפתורים?',reply_markup=kb([('🔘 כן',f'wizardbool:buttons:{cid}'),('ללא כפתורים',f'wizardbool:nobuttons:{cid}')]))
+                return
+            if step=='buttons':
+                payload['buttons']=parse_url_buttons(raw)
+                payload.pop('buttons_choice',None)
+                draft_set(uid,cid,kind,payload);pending_set(uid,cid,'wizard:reply:media')
+                await update.message.reply_text('שלב 5/5: שלח תמונה או סרטון, או /skip לדלג.');return
+            if step=='media':
+                if update.message.photo:payload['media']={'type':'photo','id':update.message.photo[-1].file_id}
+                elif update.message.video:payload['media']={'type':'video','id':update.message.video.file_id}
+                else:raise ValueError('שלח תמונה או סרטון, או /skip')
+                draft_set(uid,cid,kind,payload);clear_pending(uid)
+                await wizard_preview(update,context,cid,kind,payload);return
+        if kind=='announcement':
+            if step=='minutes':
+                minutes=int(raw)
+                if not 1<=minutes<=525600:raise ValueError()
+                payload['minutes']=minutes;draft_set(uid,cid,kind,payload);pending_set(uid,cid,'wizard:announcement:text')
+                await update.message.reply_text('שלב 2/4: שלח טקסט לפרסום, או תמונה/וידאו עם כיתוב.');return
+            if step=='text':
+                if not raw and not (update.message.photo or update.message.video):raise ValueError()
+                payload['text']=raw or ' '
+                if update.message.photo:payload['media']={'type':'photo','id':update.message.photo[-1].file_id}
+                if update.message.video:payload['media']={'type':'video','id':update.message.video.file_id}
+                draft_set(uid,cid,kind,payload);clear_pending(uid)
+                await update.message.reply_text('שלב 3/4: למחוק את הפרסום הקודם לפני הפרסום הבא?',reply_markup=kb([('🗑️ כן',f'wizardbool:deleteyes:{cid}'),('לא',f'wizardbool:deleteno:{cid}')]))
+                return
+            if step=='buttons':
+                payload['buttons']=parse_url_buttons(raw);draft_set(uid,cid,kind,payload);clear_pending(uid)
+                await wizard_preview(update,context,cid,kind,payload);return
+        if kind=='broadcast' and step=='text':
+            if not raw and not (update.message.photo or update.message.video):raise ValueError()
+            payload['text']=raw or ' '
+            if update.message.photo:payload['media']={'type':'photo','id':update.message.photo[-1].file_id}
+            if update.message.video:payload['media']={'type':'video','id':update.message.video.file_id}
+            draft_set(uid,cid,kind,payload);clear_pending(uid)
+            rows=[[('📍 לקבוצה הזאת',f'broadcasttarget:one:{cid}')]]
+            if uid==OWNER:
+                rows.append([('📍 בחירת מספר קבוצות',f'broadcasttarget:choose:{cid}')])
+                rows.append([('🌐 לכל הקבוצות המאושרות',f'broadcasttarget:all:{cid}')])
+            await update.message.reply_text('📣 בחר יעד לפרסום. לא נשלח עדיין.',reply_markup=kb(*rows));return
+    except (ValueError,TypeError,KeyError,IndexError) as e:
+        await update.message.reply_text('❌ הערך לא תקין. נסה שוב או /cancel. '+str(e)[:100]);return
+
+
+async def skip(update,context):
+    uid=update.effective_user.id
+    with conn() as c:r=c.execute('SELECT chat,field FROM pending_edits WHERE uid=?',(uid,)).fetchone()
+    if not r or not r['field'].startswith('wizard:'):return
+    cid=r['chat'];step=r['field'].split(':')[-1];d=draft_get(uid)
+    if not d or d[0]!=cid:return
+    _,kind,payload=d
+    if kind=='reply' and step=='buttons':
+        payload['buttons']=[];draft_set(uid,cid,kind,payload);pending_set(uid,cid,'wizard:reply:media')
+        await update.message.reply_text('שלח תמונה או סרטון, או /skip לדלג.');return
+    if kind=='reply' and step=='media':
+        draft_set(uid,cid,kind,payload);clear_pending(uid);await wizard_preview(update,context,cid,kind,payload);return
+    if kind=='announcement' and step=='buttons':
+        payload['buttons']=[];draft_set(uid,cid,kind,payload);clear_pending(uid);await wizard_preview(update,context,cid,kind,payload)
+
+
 async def cancel(update,context):
     PENDING.pop(update.effective_user.id,None)
+    draft_clear(update.effective_user.id)
     clear_pending(update.effective_user.id)
     await update.message.reply_text('בוטל.')
 
@@ -673,6 +991,7 @@ async def new_members(update,context):
     if d['service_delete']:await safe_delete(context.bot,cid,msg.message_id)
     for user in msg.new_chat_members:
         if user.is_bot:continue
+        metric(cid,'joins')
         if d['verify']:
             try:
                 await context.bot.restrict_chat_member(cid,user.id,permissions=ChatPermissions(can_send_messages=False))
@@ -689,7 +1008,7 @@ async def service(update,context):
 
 
 async def warning(bot,cid,user,reason=''):
-    d=cfg(cid);n=warn_count(cid,user.id,1)
+    d=cfg(cid);n=warn_count(cid,user.id,1);metric(cid,'warnings')
     txt=f'⚠️ המשתמש {mention(user)}, זוהי אזהרה {n}/{d["max_warn"]}'
     if reason:txt+=f'\n📋 סיבה: {html.escape(reason)}'
     if n>=d['max_warn']:
@@ -936,10 +1255,21 @@ async def periodic(context):
         if g['locked']:continue
         changed=False
         for item in d['announcements']:
+            if item.get('enabled',True) is False:continue
+            if item.get('skip_shabbat_holiday',False) and (shabbat(now.date()) or yom_tov(now.date())):continue
+            if item.get('active_hours'):
+                start_h,end_h=item['active_hours']
+                hm_now=now.strftime('%H:%M')
+                if start_h<=end_h and not (start_h<=hm_now<=end_h):continue
+                if start_h>end_h and not (hm_now>=start_h or hm_now<=end_h):continue
             if stamp-int(item.get('last',0))>=int(item.get('minutes',60))*60:
-                try:await send_formatted(context.bot,cid,item['text'],markup=buttons(item.get('buttons')),media=item.get('media'))
+                try:
+                    if item.get('delete_previous') and item.get('last_mid'):
+                        await safe_delete(context.bot,cid,item['last_mid'])
+                    sent=await send_formatted(context.bot,cid,item['text'],markup=buttons(item.get('buttons')),media=item.get('media'))
+                    item['last_mid']=sent.message_id if sent else None
+                    item['last']=stamp;changed=True;metric(cid,'announcements')
                 except TelegramError:log.exception('Announcement send')
-                item['last']=stamp;changed=True
         if changed:save_cfg(cid,d)
 
 
@@ -974,6 +1304,7 @@ def main():
     app.add_handler(CommandHandler('register',register_group))
     app.add_handler(CommandHandler('groups',groups_cmd))
     app.add_handler(CommandHandler('cancel',cancel))
+    app.add_handler(CommandHandler('skip',skip))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(ChatMemberHandler(my_member,ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT|filters.PHOTO|filters.VIDEO) & ~filters.COMMAND,input_private))

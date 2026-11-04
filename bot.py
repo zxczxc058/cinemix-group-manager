@@ -493,7 +493,18 @@ async def callbacks(update,context):
         return
     g=get_group(cid)
     if not g or not g.get('active',1):
-        await q.answer('הקבוצה לא פעילה כרגע. שלח /register בקבוצה כדי לרשום אותה.',show_alert=True);return
+        # Telegram is authoritative about current membership. Recover a stale
+        # active flag or a missing row without requiring /register in the group.
+        # A missing database row is never automatically approved.
+        try:
+            chat = await context.bot.get_chat(cid)
+            if await ensure_group(context.bot, chat, notify=True):
+                g = get_group(cid)
+        except TelegramError as exc:
+            log.warning('Cannot recover group %s from callback: %s', cid, exc)
+        if not g or not g.get('active',1):
+            await q.answer('לא ניתן לאמת כרגע שהבוט נמצא בקבוצה. בדוק הרשאות או נסה שוב.',show_alert=True)
+            return
     if not g['approved'] and uid!=OWNER:
         await q.answer('הקבוצה ממתינה לאישור בעל הבוט.',show_alert=True);return
     if action=='verify':

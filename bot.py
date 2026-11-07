@@ -24,7 +24,7 @@ from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, ChatMemberHa
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('cinemix')
 TOKEN = os.getenv('BOT_TOKEN')
-OWNER = int(os.getenv('OWNER_ID', '6390241278'))
+OWNER = int(os.getenv('OWNER_ID', '0'))
 DB = os.getenv('DB_PATH', 'cinemix_groups.sqlite3')
 TZ = ZoneInfo('Asia/Jerusalem')
 FLOODS = defaultdict(deque)
@@ -45,6 +45,8 @@ DEFAULT = {
  'holiday_unlock_text': '🌟 חג שמח! הקבוצה נפתחה.',
  'daily_lock': False, 'daily_lock_time': '23:00', 'daily_unlock_time': '07:00',
  'replies': [], 'announcements': [], 'allowlist': [], 'default_lock': False,
+  'stealth': False, 'forward_filter': 'allow', 'rules_text': '', 'rules_welcome_button': False,
+  'trusted': [], 'milestones': False, 'milestone_step': 100, 'milestone_text': '🎉 הגענו ל־{count} חברים!',
 }
 HELP = {
  'links': '🔗 חסימת קישורים: קישור של משתמש רגיל נמחק והוא מקבל אזהרה. בהגעה למכסה הוא מורחק. מנהלים ומשתמשים מורשים מוחרגים. /warn בתגובה להודעה מוסיף אזהרה ידנית.',
@@ -95,8 +97,84 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS stats (chat INTEGER, kind TEXT, amount INTEGER DEFAULT 0, PRIMARY KEY(chat,kind))')
     c.execute('CREATE TABLE IF NOT EXISTS drafts (uid INTEGER PRIMARY KEY, chat INTEGER, kind TEXT, payload TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS group_requests (chat INTEGER PRIMARY KEY, notified INTEGER DEFAULT 0, requested_at INTEGER)')
+    c.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, chat INTEGER, actor INTEGER, action TEXT, detail TEXT, created INTEGER)')
+    c.execute('CREATE TABLE IF NOT EXISTS owner_backups (id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER, payload TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS member_counts (chat INTEGER PRIMARY KEY, last_count INTEGER DEFAULT 0)')
     c.commit()
     return c
+
+
+def meta_get(key, default=''):
+    with conn() as c:
+        row=c.execute('SELECT val FROM meta WHERE key=?',(key,)).fetchone()
+    return row['val'] if row else default
+
+
+def meta_set(key,value):
+    with conn() as c:
+        c.execute('INSERT OR REPLACE INTO meta(key,val) VALUES (?,?)',(key,str(value)))
+        c.commit()
+
+
+def audit(cid,uid,action,detail=''):
+    with conn() as c:
+        c.execute('INSERT INTO audit(chat,actor,action,detail,created) VALUES (?,?,?,?,?)',(cid,uid,action,str(detail)[:500],int(time.time())))
+        c.commit()
+
+
+def approved_groups():
+    return [g for g in all_groups() if g['approved'] and g['active']]
+
+
+def backup_payload():
+    with conn() as c:
+        groups=[dict(r) for r in c.execute('SELECT * FROM groups')]
+        warnings=[dict(r) for r in c.execute('SELECT * FROM warnings')]
+    return {'format':'cinemix-owner-backup-v1','created':int(time.time()),'groups':groups,'warnings':warnings}
+
+
+def backup_save():
+    data=backup_payload()
+    with conn() as c:
+        c.execute('INSERT INTO owner_backups(created,payload) VALUES (?,?)',(data['created'],json.dumps(data,ensure_ascii=False)))
+        c.execute('DELETE FROM owner_backups WHERE id NOT IN (SELECT id FROM owner_backups ORDER BY id DESC LIMIT 30)')
+        c.commit()
+    return data
+
+
+def restore_backup(data):
+    if not isinstance(data,dict) or data.get('format')!='cinemix-owner-backup-v1':raise ValueError('Invalid backup')
+    groups=data.get('groups');warnings=data.get('warnings')
+    if not isinstance(groups,list) or not isinstance(warnings,list):raise ValueError('Invalid backup contents')
+    with conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        c.execute('DELETE FROM groups');c.execute('DELETE FROM warnings')
+        for g in groups:
+            cols=('id','title','approved','settings','locked','permissions','lock_reason','last_announcement','active')
+            c.execute('INSERT INTO groups ('+','.join(cols)+') VALUES ('+','.join('?' for _ in cols)+')',tuple(g.get(k) for k in cols))
+        for w in warnings:c.execute('INSERT INTO warnings(chat,uid,count) VALUES (?,?,?)',(w['chat'],w['uid'],w['count']))
+        c.commit()
+
+
+async def owner_notify(bot, text, to_groups=True, to_admins=True):
+    successes=0;failures=0;seen=set()
+    for group in approved_groups():
+        cid=group['id']
+        if to_groups:
+            try:await bot.send_message(cid,text);successes+=1
+            except TelegramError:failures+=1
+        if to_admins:
+            try:
+                admins=await bot.get_chat_administrators(cid)
+                for adm in admins:
+                    user=adm.user
+                    if user.is_bot or user.id in seen:continue
+                    seen.add(user.id)
+                    try:await bot.send_message(user.id,text);successes+=1
+                    except TelegramError:failures+=1
+            except TelegramError:failures+=1
+        await asyncio.sleep(0.1)
+    return successes,failures
 
 
 def metric(cid,kind,n=1):
@@ -367,7 +445,10 @@ def menu(cid):
               [('📦 גיבוי',f'page:backup:{cid}'),('🗑️ הודעות שירות',f'page:service:{cid}')],
               [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
               [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('👑 פאנל בעלים',f'ownerall:x:{cid}')],
-              [('📖 מדריך',f'page:guide:{cid}'),('⬅️ קבוצות',f'list:all:0')])
+              [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🧪 סימולטור',f'page:simulator:{cid}')],
+               [('📜 חוקי קבוצה',f'page:rules:{cid}'),('🔄 הודעות מועברות',f'page:forward:{cid}')],
+               [('📋 יומן פעולות',f'page:audit:{cid}'),('⭐ משתמשים מהימנים',f'page:trusted:{cid}')],
+               [('📖 מדריך',f'page:guide:{cid}'),('⬅️ קבוצות',f'list:all:0')])
 
 
 async def list_groups(bot,uid,cid):
@@ -398,7 +479,8 @@ def owner_menu():
         [('📥 בקשות ממתינות','owner:pending:0'),('🩺 בריאות קבוצות','owner:health:0')],
         [('📣 פרסום מרכזי','owner:broadcast:0'),('📈 פעילות מערכת','owner:metrics:0')],
         [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
-        [('📖 מדריך','guide:all:0')])
+        [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
+         [('📖 מדריך','guide:all:0')])
 
 
 async def owner_dashboard(bot,recipient,section):
@@ -432,6 +514,16 @@ async def owner_dashboard(bot,recipient,section):
         with conn() as c:
             rows=c.execute('SELECT kind,SUM(amount) AS total FROM stats GROUP BY kind ORDER BY total DESC LIMIT 20').fetchall()
         msg='📈 פעילות המערכת\n'+('\n'.join(f'• {r["kind"]}: {r["total"]}' for r in rows) if rows else 'אין עדיין פעולות שנמדדו.')
+    elif section=='backups':
+        with conn() as c: rows=c.execute('SELECT id,created FROM owner_backups ORDER BY id DESC LIMIT 8').fetchall()
+        msg='💾 גיבויי בעלים\n'+('\n'.join(f'#{r["id"]} — {datetime.fromtimestamp(r["created"],TZ):%d/%m/%Y %H:%M}' for r in rows) if rows else 'אין עדיין גיבויים.')
+        await bot.send_message(recipient,msg,reply_markup=kb([('📦 צור גיבוי','ownerbackup:create:0')],[('📥 שחזור גיבוי אחרון','ownerbackup:restore:0')],[('⬅️ חזרה','owner:overview:0')]))
+        return
+    elif section=='maintenance':
+        active=meta_get('maintenance','0')=='1'
+        msg=f'🛠️ מצב תחזוקה: {"פעיל" if active else "כבוי"}\n\nבעת תחזוקה מנהלים לא יכולים לשנות הגדרות. ההגנות ונעילות הקבוצות ממשיכות לפעול.\nהודעת התחזוקה נשלחת לקבוצות המאושרות ולמנהלים שניתן לפנות אליהם בפרטי.'
+        await bot.send_message(recipient,msg,reply_markup=kb([('🟢 הפעל תחזוקה' if not active else '🔴 סיים תחזוקה','ownermaintenance:toggle:0')],[('✏️ ערוך הודעת תחזוקה','ownermaintenance:text:0')],[('⬅️ חזרה','owner:overview:0')]))
+        return
     elif section=='start':
         msg='📝 הודעת הפתיחה הנוכחית:\n\n'+regular_start_text()[:2500]+'\n\nלשינוי: /setstart'
     elif section=='settings':
@@ -547,6 +639,12 @@ def page_keyboard(cid,page):
     rows=[]
     if page in toggles:
         key=toggles[page];rows.append([('🟢 פעיל' if d[key] else '🔴 כבוי',f'toggle:{key}:{cid}')])
+    if page=='stealth':rows.append([('🟢 מצב סמוי פעיל' if d['stealth'] else '🔴 מצב סמוי כבוי',f'toggle:stealth:{cid}')])
+    if page=='forward':rows.append([('🔄 מצב: '+d['forward_filter'],f'cycle:forward_filter:{cid}')])
+    if page=='rules':rows.extend([[('✏️ עריכת חוקי קבוצה',f'edit:rules_text:{cid}')],[('📢 פרסום החוקים',f'rulespublish:x:{cid}')]])
+    if page=='simulator':rows.append([('🧪 שלח הודעה לבדיקה',f'simstart:x:{cid}')])
+    if page=='audit':rows.append([('📋 20 פעולות אחרונות',f'auditshow:x:{cid}')])
+    if page=='trusted':rows.append([('📖 הסבר שימוש',f'help:trusted:{cid}')])
     if page=='links':rows.append([(f'⚠️ אזהרות: {d["max_warn"]}',f'edit:max_warn:{cid}')])
     if page=='welcome':
         rows.extend([[('✏️ טקסט ברוכים הבאים',f'edit:welcome_text:{cid}')],
@@ -608,6 +706,34 @@ async def callbacks(update,context):
             source=candidates[0]['id'];draft_set(uid,source,'broadcast',{'source':source});pending_set(uid,source,'wizard:broadcast:text')
             await q.message.reply_text('📣 פרסום מרכזי: שלח טקסט מעוצב, תמונה או סרטון עם כיתוב. לאחר מכן תבחר יעדים ותאשר.');return
         await owner_dashboard(context.bot,q.message.chat_id,value);return
+    if action=='ownerbackup':
+        if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
+        await q.answer()
+        if value=='create':
+            from io import BytesIO
+            data=backup_save();buf=BytesIO(json.dumps(data,ensure_ascii=False,indent=2).encode());buf.name='CINEMIX_owner_backup.json'
+            await context.bot.send_document(uid,buf,caption='💾 גיבוי מלא של הקבוצות והאזהרות. שמור את הקובץ במקום פרטי.')
+        elif value=='restore':
+            await q.message.reply_text('⚠️ שחזור יחליף את הקבוצות והאזהרות במסד הנתונים. יש לבצע רק לאחר בדיקה וגיבוי נוסף.',reply_markup=kb([('⚠️ אשר שחזור אחרון','ownerbackup:confirm:0')],[('❌ ביטול','owner:backups:0')]))
+        elif value=='confirm':
+            with conn() as c:r=c.execute('SELECT payload FROM owner_backups ORDER BY id DESC LIMIT 1').fetchone()
+            if r:
+                restore_data=json.loads(r['payload']);backup_save();restore_backup(restore_data)
+                await q.message.reply_text('✅ השחזור בוצע. בדוק את הקבוצות והרשאות הבוט בטלגרם.')
+            else:await q.message.reply_text('אין גיבוי לשחזור.')
+        return
+    if action=='ownermaintenance':
+        if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
+        await q.answer()
+        if value=='text':
+            pending_set(uid,0,'maintenance_text');await q.message.reply_text('✏️ שלח את הודעת התחזוקה שתופיע בקבוצות ובפרטי למנהלים. /cancel לביטול.');return
+        if value=='toggle':
+            active=meta_get('maintenance','0')=='1';new=not active
+            meta_set('maintenance','1' if new else '0')
+            txt=meta_get('maintenance_text','🛠️ הבוט נמצא כעת בתחזוקה. אפשרויות הניהול זמנית אינן זמינות.') if new else '✅ תחזוקת CINEMIX הסתיימה. אפשרויות הניהול חזרו לפעילות.'
+            sent,failed=await owner_notify(context.bot,txt)
+            await q.message.reply_text(f'{"🛠️ התחזוקה הופעלה" if new else "✅ התחזוקה הסתיימה"}\nהודעות שנשלחו: {sent}\nשליחות שנכשלו: {failed}')
+        return
     if action=='list':
         await q.answer();await list_groups(context.bot,uid,q.message.chat_id);return
     if action=='guide':
@@ -660,6 +786,8 @@ async def callbacks(update,context):
         return
     if not await authorized(context.bot,uid,cid):
         await q.answer('אין הרשאה',show_alert=True);return
+    if uid!=OWNER and meta_get('maintenance','0')=='1' and action not in ('open','page','help','stats','health','show'):
+        await q.answer('🛠️ הבוט נמצא בתחזוקה. שינוי הגדרות אינו זמין כרגע.',show_alert=True);return
     if action=='wiz':
         if q.message.chat.type!='private':await q.answer('רק בפרטי',show_alert=True);return
         await q.answer()
@@ -786,6 +914,16 @@ async def callbacks(update,context):
             await q.message.reply_text('🩺 בדיקת הרשאות\n'+'\n'.join(('✅ ' if ok else '❌ ')+name for name,ok in checks))
         except TelegramError as e:await q.message.reply_text(f'❌ בדיקה נכשלה: {e}')
         return
+    if action=='simstart':
+        pending_set(uid,cid,'simulate');await q.answer();await q.message.reply_text('🧪 שלח טקסט לדוגמה. לא תימחק הודעה ולא תינתן אזהרה.');return
+    if action=='auditshow':
+        with conn() as c:rows=c.execute('SELECT * FROM audit WHERE chat=? ORDER BY id DESC LIMIT 20',(cid,)).fetchall()
+        msg='📋 יומן פעולות\n'+('\n'.join(f'{datetime.fromtimestamp(r["created"],TZ):%d/%m %H:%M} | {r["actor"]} | {r["action"]} | {r["detail"][:55]}' for r in rows) if rows else 'אין פעולות מתועדות עדיין.')
+        await q.answer();await q.message.reply_text(msg[:3900]);return
+    if action=='rulespublish':
+        await q.answer();rules=cfg(cid).get('rules_text','')
+        if not rules:await q.message.reply_text('קודם הגדר חוקי קבוצה.');return
+        await send_formatted(context.bot,cid,rules);audit(cid,uid,'publish_rules');return
     if action=='stats':
         await q.answer()
         with conn() as c:rows=c.execute('SELECT kind,amount FROM stats WHERE chat=?',(cid,)).fetchall()
@@ -814,11 +952,14 @@ async def callbacks(update,context):
         await q.answer()
         desc=HELP.get(value,'בחר פעולה בתפריט. ההגדרות יישמרו לקבוצה זו בלבד.')
         if value=='guide':desc='\n\n'.join(HELP.values())[:3900]
+        if value=='stealth':desc='🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, ואז שלח את התשובה לבוט בפרטי. הבוט יפרסם תגובה להודעה המקורית.\n\nפקודות ניהול בתגובה להודעה: /warn, /mute 30m, /ban, /unmute. הפקודה עלולה להיות גלויה לרגע לפני מחיקתה.'
+        if value=='forward':desc='🔄 סינון הודעות מועברות: allow = מותר; channels = חסימת העברות מערוצים; all = חסימת כל ההעברות. מנהלים פטורים.'
+        if value=='trusted':desc='⭐ משתמשים מהימנים: הגב להודעה עם /allow כדי להחריג משתמש מחסימת קישורים ואנטי־ספאם, או /unallow להסרה.'
         await q.message.reply_text(desc,reply_markup=page_keyboard(cid,value) if value!='guide' else None)
         return
     if action=='help':await q.answer();await q.message.reply_text(HELP.get(value,''));return
     if action=='toggle':
-        if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock'):await q.answer('לא נתמך');return
+        if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth'):await q.answer('לא נתמך');return
         new_state=not cfg(cid)[value]
         set_cfg(cid,value,new_state);await q.answer('נשמר')
         if value=='daily_lock':
@@ -826,6 +967,8 @@ async def callbacks(update,context):
         else:
             await q.message.reply_text('✅ ההגדרה עודכנה.',reply_markup=menu(cid))
         return
+    if action=='cycle' and value=='forward_filter':
+        modes=['allow','channels','all'];current=cfg(cid)['forward_filter'];set_cfg(cid,'forward_filter',modes[(modes.index(current)+1)%3]);await q.answer('נשמר');await q.message.reply_text('🔄 סינון הודעות מועברות: '+cfg(cid)['forward_filter']);return
     if action=='cycle' and value=='word_action':
         opts=['delete','warn','mute','ban'];cur=cfg(cid)['word_action'];set_cfg(cid,'word_action',opts[(opts.index(cur)+1)%len(opts)]);await q.answer('נשמר');return
     if action=='edit':
@@ -914,9 +1057,18 @@ async def input_private(update,context):
             await update.message.reply_text('ℹ️ אין כרגע הגדרה שממתינה לערך. בחר הגדרה בתפריט, או שלח /setstart כדי לשנות את הודעת הפתיחה.')
         return
     cid,key=pending
+    if meta_get('maintenance','0')=='1' and uid!=OWNER and key not in ('simulate',):
+        await update.message.reply_text('🛠️ הבוט בתחזוקה. לא ניתן לשנות הגדרות כעת.');return
     if key.startswith('wizard:'):
         await wizard_input(update,context,cid,key)
         return
+    if key=='simulate':
+        text=(update.message.text or update.message.caption or '')
+        d=cfg(cid);reasons=[]
+        if d['links'] and re.search(r'(?i)(https?://|www\.|t\.me/)',text):reasons.append('🔗 קישור אסור — מחיקה ואזהרה')
+        if d['words'] and any(w in text.lower() for w in d['words']):reasons.append('🚫 מילה אסורה — '+d['word_action'])
+        await update.message.reply_text('🧪 סימולציה בלבד\n'+('\n'.join(reasons) if reasons else '✅ לא זוהתה הפרה לפי בדיקת הטקסט. בדיקת הצפה דורשת רצף הודעות ולכן אינה נבדקת כאן.'))
+        clear_pending(uid);return
     if key.startswith('annhours:'):
         group=get_group(cid)
         if not group or not group['approved'] or (uid!=OWNER and not await authorized(context.bot,uid,cid)):
@@ -931,6 +1083,30 @@ async def input_private(update,context):
             d=cfg(cid);d['announcements'][index]['active_hours']=hours;save_cfg(cid,d);clear_pending(uid)
             await update.message.reply_text('✅ שעות הפעילות נשמרו')
         except (ValueError,IndexError,KeyError):await update.message.reply_text('❌ שלח 09:00-23:00 או מחק')
+        return
+    if key=='maintenance_text':
+        if uid!=OWNER:return
+        value=(update.message.text or '').strip()
+        if not value or len(value)>3500:await update.message.reply_text('שלח טקסט עד 3500 תווים.');return
+        meta_set('maintenance_text',value);clear_pending(uid)
+        await update.message.reply_text('✅ הודעת התחזוקה נשמרה.');return
+    if key=='stealth_reply':
+        group=get_group(cid)
+        draft=draft_get(uid)
+        if not group or not group['approved'] or not draft or draft[1]!='stealth_reply' or not await authorized(context.bot,uid,cid):
+            clear_pending(uid);draft_clear(uid);await update.message.reply_text('הבקשה אינה זמינה.');return
+        payload=draft[2]
+        try:
+            media=None
+            if update.message.photo:media={'type':'photo','id':update.message.photo[-1].file_id}
+            if update.message.video:media={'type':'video','id':update.message.video.file_id}
+            body=message_formatted(update.message) or ('📷' if media else '')
+            if not body and not media:await update.message.reply_text('שלח טקסט, תמונה או סרטון.');return
+            await send_formatted(context.bot,cid,body,markup=None,media=media,reply_to=payload['mid'])
+            audit(cid,uid,'stealth_reply',str(payload['mid']))
+            clear_pending(uid);draft_clear(uid)
+            await update.message.reply_text('✅ התשובה פורסמה בקבוצה בשם הבוט.')
+        except TelegramError as exc:await update.message.reply_text('❌ לא ניתן לפרסם את התשובה: '+str(exc)[:120])
         return
     if key=='owner_start_text':
         if uid!=OWNER:return
@@ -1209,6 +1385,11 @@ async def moderate(update,context):
             return
     if not msg.from_user:return
     d=cfg(cid);u=msg.from_user
+    if msg.forward_origin and d.get('forward_filter') in ('channels','all'):
+        from telegram import MessageOriginChannel
+        if d['forward_filter']=='all' or isinstance(msg.forward_origin,MessageOriginChannel):
+            if not await authorized(context.bot,u.id,cid):
+                await safe_delete(context.bot,cid,msg.message_id);audit(cid,u.id,'forward_deleted');return
     with conn() as c:
         c.execute('INSERT OR IGNORE INTO seen VALUES (?,?,?)',(cid,msg.message_id,int(time.time())));c.commit()
     exempt=await authorized(context.bot,u.id,cid) or u.id in d['allowlist']
@@ -1259,8 +1440,24 @@ async def commands(update,context):
     g=get_group(cid)
     if not g or not g['approved']:return
     await safe_delete(context.bot,cid,msg.message_id)
+    if meta_get('maintenance','0')=='1' and u.id!=OWNER:
+        try:await context.bot.send_message(u.id,'🛠️ הבוט נמצא בתחזוקה, פעולות ניהול זמנית אינן זמינות.')
+        except TelegramError:pass
+        return
     target=msg.reply_to_message.from_user if msg.reply_to_message else None
     args=msg.text.split()[1:]
+    if cmd=='reply':
+        if not cfg(cid).get('stealth'):
+            try:await context.bot.send_message(u.id,'🕵️ הפעל תחילה מצב מנהל סמוי בפאנל הקבוצה.')
+            except TelegramError:pass
+            return
+        if not msg.reply_to_message:return
+        draft_set(u.id,cid,'stealth_reply',{'mid':msg.reply_to_message.message_id})
+        pending_set(u.id,cid,'stealth_reply')
+        try:await context.bot.send_message(u.id,'💬 שלח כאן את התשובה שלך. היא תפורסם בקבוצה כתגובה להודעה המקורית, בשם הבוט. /cancel לביטול.')
+        except TelegramError:pass
+        return
+    audit(cid,u.id,'command',cmd)
     if cmd in ('lock','unlock'):
         await change_lock(context.bot,cid,cmd=='lock','manual');return
     if cmd=='clean':
@@ -1347,10 +1544,14 @@ async def change_lock(bot,cid,lock,reason):
             key='holiday_lock_text' if reason=='holiday' else 'shabbat_lock_text' if reason=='shabbat' else 'lock_text'
         else:
             original=json.loads(g['permissions'] or '{}')
+            if not original:
+                log.error('Refusing to unlock %s without saved permissions',cid)
+                return
             await bot.set_chat_permissions(cid,ChatPermissions(**original))
             set_group(cid,locked=0,permissions=None,lock_reason=None)
             key='holiday_unlock_text' if g['lock_reason']=='holiday' else 'shabbat_unlock_text' if g['lock_reason']=='shabbat' else 'unlock_text'
         await send_formatted(bot,cid,d[key])
+        audit(cid,OWNER,'lock' if lock else 'unlock',reason)
     except TelegramError:log.exception('Lock/unlock failed for %s',cid)
 
 
@@ -1400,6 +1601,11 @@ async def calendar_tick(bot, cid, group_row, settings, now):
     # Keep the group locked across adjacent Yom Tov/Shabbat days.
     if next_shabbat or next_holiday:
         return
+    if settings.get('daily_lock'):
+        start,end=settings['daily_lock_time'],settings['daily_unlock_time']
+        hm=now.strftime('%H:%M')
+        if start!=end and ((start<=hm<end) if start<end else (hm>=start or hm<end)):
+            return
     if in_period:
         if now >= deadline:
             await change_lock(bot, cid, False, group_row['lock_reason'])
@@ -1415,6 +1621,8 @@ async def periodic(context):
     for item in expired:
         await safe_delete(context.bot,item['chat'],item['mid'])
         with conn() as c:c.execute('DELETE FROM welcomes WHERE chat=? AND mid=?',(item['chat'],item['mid']));c.commit()
+    if meta_get('backup_day')!=now.strftime('%Y-%m-%d'):
+        backup_save();meta_set('backup_day',now.strftime('%Y-%m-%d'))
     for g in all_groups():
         cid=g['id']
         if not g['approved'] or not g['active']:continue
@@ -1436,6 +1644,7 @@ async def periodic(context):
             if current['locked'] and current['lock_reason']=='daily':
                 await change_lock(context.bot,cid,False,'daily')
         if get_group(cid)['locked']:continue
+
         changed=False
         for item in d['announcements']:
             if item.get('enabled',True) is False:continue
@@ -1492,7 +1701,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT|filters.PHOTO|filters.VIDEO) & ~filters.COMMAND,input_private))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS,new_members))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.StatusUpdate.LEFT_CHAT_MEMBER|filters.StatusUpdate.NEW_CHAT_TITLE|filters.StatusUpdate.NEW_CHAT_PHOTO|filters.StatusUpdate.DELETE_CHAT_PHOTO|filters.StatusUpdate.PINNED_MESSAGE),service))
-    group_commands=['warn','warnings','mute','unmute','ban','unban','clean','lock','unlock','allow','unallow','export','import']
+    group_commands=['reply','warn','warnings','mute','unmute','ban','unban','clean','lock','unlock','allow','unallow','export','import']
     for command in group_commands:app.add_handler(CommandHandler(command,commands,filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,moderate))
     app.add_error_handler(error_handler)

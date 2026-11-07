@@ -535,7 +535,7 @@ async def owner_dashboard(bot,recipient,section):
              'גיבוי קבוצתי, הודעות חוזרות ויתר ההגדרות נמצאים בתוך ניהול הקבוצה. '
              'לא מתבצע שינוי גורף בהגדרות הקבוצות ללא אישור מפורש.')
     else:return
-    await bot.send_message(recipient,msg[:3900],reply_markup=owner_menu())
+    await bot.send_message(recipient,msg[:3900],reply_markup=kb([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')]) if section!='overview' else owner_menu())
 
 
 async def owner_panel(update,context):
@@ -632,6 +632,44 @@ def broadcast_picker(payload):
     rows.append([('✅ סיום בחירה',f'broadcastpick:done:{payload["source"]}')])
     return kb(*rows)
 
+
+# Navigation: actions refresh their current submenu; only Back navigates upward.
+FIELD_PAGES = {
+    'links':'links','max_warn':'links','welcome':'welcome','welcome_text':'welcome',
+    'welcome_buttons':'welcome','welcome_media':'welcome','welcome_seconds':'welcome',
+    'flood':'flood','flood_count':'flood','flood_seconds':'flood','flood_mute':'flood',
+    'words':'words','word_action':'words','word_mute':'words',
+    'daily_lock':'lock','daily_lock_time':'lock','daily_unlock_time':'lock',
+    'lock_text':'lock','unlock_text':'lock',
+    'shabbat':'calendar','holiday':'calendar','friday_time':'calendar',
+    'holiday_time':'calendar','end_offset':'calendar','nightfall_minutes':'calendar',
+    'shabbat_lock_text':'calendar','shabbat_unlock_text':'calendar',
+    'holiday_lock_text':'calendar','holiday_unlock_text':'calendar',
+    'verify':'verify','service_delete':'service','channel_posts_delete':'channels',
+    'stealth':'stealth','forward_filter':'forward','rules_text':'rules',
+}
+
+def settings_page_text(page):
+    if page=='stealth':
+        return ('🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, '
+                'ואז שלח את התשובה לבוט בפרטי.\n\nפקודות: /warn, /mute 30m, /ban, /unmute.')
+    if page=='forward':
+        return '🔄 סינון הודעות מועברות: allow = מותר; channels = מערוצים; all = הכול.'
+    if page=='trusted':
+        return '⭐ משתמשים מהימנים: /allow בתגובה להודעה, /unallow להסרה.'
+    return HELP.get(page,'⚙️ הגדרות הקבוצה — בחר פעולה:')
+
+async def refresh_settings(query,cid,page,notice=''):
+    text=(notice+'\n\n' if notice else '')+settings_page_text(page)
+    markup=page_keyboard(cid,page)
+    try:
+        await query.edit_message_text(text[:3900],reply_markup=markup)
+    except TelegramError as exc:
+        if 'Message is not modified' not in str(exc):
+            await query.message.reply_text(text[:3900],reply_markup=markup)
+
+async def private_settings_result(message,cid,page,notice='✅ נשמר בהצלחה!'):
+    await message.reply_text(notice+'\n\n'+settings_page_text(page),reply_markup=page_keyboard(cid,page))
 
 def page_keyboard(cid,page):
     d=cfg(cid)
@@ -732,7 +770,7 @@ async def callbacks(update,context):
             meta_set('maintenance','1' if new else '0')
             txt=meta_get('maintenance_text','🛠️ הבוט נמצא כעת בתחזוקה. אפשרויות הניהול זמנית אינן זמינות.') if new else '✅ תחזוקת CINEMIX הסתיימה. אפשרויות הניהול חזרו לפעילות.'
             sent,failed=await owner_notify(context.bot,txt)
-            await q.message.reply_text(f'{"🛠️ התחזוקה הופעלה" if new else "✅ התחזוקה הסתיימה"}\nהודעות שנשלחו: {sent}\nשליחות שנכשלו: {failed}')
+            await q.message.reply_text(f'{"🛠️ התחזוקה הופעלה" if new else "✅ התחזוקה הסתיימה"}\nהודעות שנשלחו: {sent}\nשליחות שנכשלו: {failed}',reply_markup=kb([('🟢 הפעל תחזוקה' if not new else '🔴 סיים תחזוקה','ownermaintenance:toggle:0')],[('✏️ ערוך הודעת תחזוקה','ownermaintenance:text:0')],[('⬅️ חזרה','owner:overview:0')]))
         return
     if action=='list':
         await q.answer();await list_groups(context.bot,uid,q.message.chat_id);return
@@ -849,7 +887,7 @@ async def callbacks(update,context):
             payload.pop('buttons_choice',None)
             if kind=='announcements':payload['last']=int(time.time());payload['last_mid']=None
             data[kind].append(payload);save_cfg(cid,data);draft_clear(uid);clear_pending(uid)
-            await q.message.reply_text('✅ נשמר בהצלחה!');return
+            await refresh_settings(q,cid,'replies' if kind=='replies' else 'announcements','✅ נשמר בהצלחה!');return
         if value=='send' and d[1]=='broadcast':
             targets=payload.get('targets',[])
             sent=0;failed=[]
@@ -919,11 +957,11 @@ async def callbacks(update,context):
     if action=='auditshow':
         with conn() as c:rows=c.execute('SELECT * FROM audit WHERE chat=? ORDER BY id DESC LIMIT 20',(cid,)).fetchall()
         msg='📋 יומן פעולות\n'+('\n'.join(f'{datetime.fromtimestamp(r["created"],TZ):%d/%m %H:%M} | {r["actor"]} | {r["action"]} | {r["detail"][:55]}' for r in rows) if rows else 'אין פעולות מתועדות עדיין.')
-        await q.answer();await q.message.reply_text(msg[:3900]);return
+        await q.answer();await q.message.reply_text(msg[:3900],reply_markup=kb([('⬅️ חזרה ליומן',f'page:audit:{cid}') ]));return
     if action=='rulespublish':
         await q.answer();rules=cfg(cid).get('rules_text','')
         if not rules:await q.message.reply_text('קודם הגדר חוקי קבוצה.');return
-        await send_formatted(context.bot,cid,rules);audit(cid,uid,'publish_rules');return
+        await send_formatted(context.bot,cid,rules);audit(cid,uid,'publish_rules');await refresh_settings(q,cid,'rules','✅ החוקים פורסמו.');return
     if action=='stats':
         await q.answer()
         with conn() as c:rows=c.execute('SELECT kind,amount FROM stats WHERE chat=?',(cid,)).fetchall()
@@ -938,7 +976,7 @@ async def callbacks(update,context):
         field='enabled' if action=='annswitch' else 'skip_shabbat_holiday'
         item[field]=not item.get(field,field=='enabled')
         d=cfg(cid);d['announcements'][index]=item;save_cfg(cid,d)
-        await q.answer('עודכן');await q.message.reply_text(f'✅ {field}: {item[field]}');return
+        await q.answer('עודכן');await q.message.reply_text(f'✅ עודכן: {item[field]}',reply_markup=page_keyboard(cid,'announcements'));return
     if action=='annprev':
         try:index=int(value);item=cfg(cid)['announcements'][index]
         except (ValueError,IndexError):await q.answer('לא נמצא');return
@@ -950,27 +988,20 @@ async def callbacks(update,context):
         await q.answer();await q.message.reply_text(f'⚙️ {g["title"]}\nבחר הגדרה:',reply_markup=menu(cid));return
     if action=='page':
         await q.answer()
-        desc=HELP.get(value,'בחר פעולה בתפריט. ההגדרות יישמרו לקבוצה זו בלבד.')
-        if value=='guide':desc='\n\n'.join(HELP.values())[:3900]
-        if value=='stealth':desc='🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, ואז שלח את התשובה לבוט בפרטי. הבוט יפרסם תגובה להודעה המקורית.\n\nפקודות ניהול בתגובה להודעה: /warn, /mute 30m, /ban, /unmute. הפקודה עלולה להיות גלויה לרגע לפני מחיקתה.'
-        if value=='forward':desc='🔄 סינון הודעות מועברות: allow = מותר; channels = חסימת העברות מערוצים; all = חסימת כל ההעברות. מנהלים פטורים.'
-        if value=='trusted':desc='⭐ משתמשים מהימנים: הגב להודעה עם /allow כדי להחריג משתמש מחסימת קישורים ואנטי־ספאם, או /unallow להסרה.'
-        await q.message.reply_text(desc,reply_markup=page_keyboard(cid,value) if value!='guide' else None)
+        await q.message.reply_text(settings_page_text(value) if value!='guide' else '\n\n'.join(HELP.values())[:3900],
+                                   reply_markup=page_keyboard(cid,value) if value!='guide' else kb([('⬅️ חזרה להגדרות',f'open:x:{cid}')]))
         return
     if action=='help':await q.answer();await q.message.reply_text(HELP.get(value,''));return
     if action=='toggle':
         if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth'):await q.answer('לא נתמך');return
         new_state=not cfg(cid)[value]
         set_cfg(cid,value,new_state);await q.answer('נשמר')
-        if value=='daily_lock':
-            await q.message.reply_text(('🟢 הנעילה היומית הופעלה.' if new_state else '🔴 הנעילה היומית כובתה.')+'\nהזמנים לפי שעון ישראל.',reply_markup=page_keyboard(cid,'lock'))
-        else:
-            await q.message.reply_text('✅ ההגדרה עודכנה.',reply_markup=menu(cid))
+        await refresh_settings(q,cid,FIELD_PAGES[value],'✅ ההגדרה עודכנה.')
         return
     if action=='cycle' and value=='forward_filter':
-        modes=['allow','channels','all'];current=cfg(cid)['forward_filter'];set_cfg(cid,'forward_filter',modes[(modes.index(current)+1)%3]);await q.answer('נשמר');await q.message.reply_text('🔄 סינון הודעות מועברות: '+cfg(cid)['forward_filter']);return
+        modes=['allow','channels','all'];current=cfg(cid)['forward_filter'];set_cfg(cid,'forward_filter',modes[(modes.index(current)+1)%3]);await q.answer('נשמר');await refresh_settings(q,cid,'forward','✅ הסינון עודכן.');return
     if action=='cycle' and value=='word_action':
-        opts=['delete','warn','mute','ban'];cur=cfg(cid)['word_action'];set_cfg(cid,'word_action',opts[(opts.index(cur)+1)%len(opts)]);await q.answer('נשמר');return
+        opts=['delete','warn','mute','ban'];cur=cfg(cid)['word_action'];set_cfg(cid,'word_action',opts[(opts.index(cur)+1)%len(opts)]);await q.answer('נשמר');await refresh_settings(q,cid,'words','✅ העונש עודכן.');return
     if action=='edit':
         if q.message.chat.type!='private':
             await q.answer('עריכת הגדרות בפרטי בלבד',show_alert=True);return
@@ -1012,7 +1043,7 @@ async def callbacks(update,context):
     if action=='remove':
         try:key,index=value.split(',');index=int(index);data=cfg(cid)[key];data.pop(index);set_cfg(cid,key,data)
         except Exception:await q.answer('לא נמצא');return
-        await q.answer('נמחק');await q.edit_message_text('🗑️ הפריט נמחק');return
+        await q.answer('נמחק');await q.edit_message_text('🗑️ הפריט נמחק',reply_markup=page_keyboard(cid,'replies' if key=='replies' else 'announcements' if key=='announcements' else 'allowlist'));return
     if action=='defaults':
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
         with conn() as c:c.execute("INSERT OR REPLACE INTO meta(key,val) VALUES ('owner_defaults',?)",(json.dumps(cfg(cid),ensure_ascii=False),));c.commit()
@@ -1034,7 +1065,7 @@ async def callbacks(update,context):
         await q.answer('בוטל');await q.edit_message_reply_markup(None)
         await context.bot.send_message(cid,f'🔊 ההשתקה של {mention_id(target)} בוטלה על ידי {mention(q.from_user)}',parse_mode=ParseMode.HTML);return
     if action in ('lock','unlock'):
-        await q.answer();await change_lock(context.bot,cid,action=='lock','manual');return
+        await q.answer();await change_lock(context.bot,cid,action=='lock','manual');await refresh_settings(q,cid,'lock','✅ פעולת הנעילה בוצעה.');return
     await q.answer()
 
 
@@ -1081,7 +1112,7 @@ async def input_private(update,context):
                 if not m:raise ValueError()
                 hours=[x.strip() for x in raw.split('-')]
             d=cfg(cid);d['announcements'][index]['active_hours']=hours;save_cfg(cid,d);clear_pending(uid)
-            await update.message.reply_text('✅ שעות הפעילות נשמרו')
+            await private_settings_result(update.message,cid,'announcements','✅ שעות הפעילות נשמרו')
         except (ValueError,IndexError,KeyError):await update.message.reply_text('❌ שלח 09:00-23:00 או מחק')
         return
     if key=='maintenance_text':
@@ -1160,7 +1191,7 @@ async def input_private(update,context):
                 elif raw.strip() in ('מחק','remove'):val=None
                 else:raise ValueError()
                 d[kind][index]['media']=val
-            save_cfg(cid,d);clear_pending(uid);await update.message.reply_text('✅ נשמר');return
+            save_cfg(cid,d);clear_pending(uid);await private_settings_result(update.message,cid,'replies' if kind=='replies' else 'announcements');return
         elif key.startswith('item:'):
             _,kind,index=key.split(':');index=int(index)
             if kind=='replies':
@@ -1170,20 +1201,20 @@ async def input_private(update,context):
             elif kind=='announcements':
                 minutes,response=raw.split('|',1);minutes=int(minutes);assert minutes>0
                 d[kind][index].update(minutes=minutes,text=response.strip(),last=int(time.time()))
-            save_cfg(cid,d);clear_pending(uid);await update.message.reply_text('✅ נערך בהצלחה');return
+            save_cfg(cid,d);clear_pending(uid);await private_settings_result(update.message,cid,'replies' if kind=='replies' else 'announcements','✅ נערך בהצלחה');return
         elif key=='add_reply':
             trigger,mode,response=[x.strip() for x in raw.split('|',2)]
             assert mode in ('exact','contains') and trigger and response
             d['replies'].append({'trigger':trigger,'mode':mode,'text':response,'buttons':[]});save_cfg(cid,d)
-            clear_pending(uid);await update.message.reply_text('✅ התגובה נוספה');return
+            clear_pending(uid);await private_settings_result(update.message,cid,'replies','✅ התגובה נוספה');return
         elif key=='add_announcement':
             minutes,response=raw.split('|',1);minutes=int(minutes.strip());assert minutes>=1
             d['announcements'].append({'minutes':minutes,'text':response.strip(),'last':int(time.time())});save_cfg(cid,d)
-            clear_pending(uid);await update.message.reply_text('✅ ההודעה החוזרת נוספה');return
+            clear_pending(uid);await private_settings_result(update.message,cid,'announcements','✅ ההודעה החוזרת נוספה');return
         else:val='HTML:'+update.message.text_html if update.message.text and update.message.entities else raw
         set_cfg(cid,key,val)
         clear_pending(uid)
-        await update.message.reply_text('✅ נשמר בהצלחה!')
+        await private_settings_result(update.message,cid,FIELD_PAGES.get(key,'lock'))
     except Exception:
         log.exception('Private input validation failed for field %s',key)
         await update.message.reply_text('❌ פורמט לא תקין. ההגדרה עדיין ממתינה — שלח ערך תקין או /cancel.')

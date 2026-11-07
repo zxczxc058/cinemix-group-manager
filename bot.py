@@ -55,7 +55,7 @@ HELP = {
  'calendar': '🕯️ שבת וחג: נעילה בשעה קבועה ביום שישי או בערב חג לפי לוח ישראל. פתיחה לפי שקיעה בירושלים + דקות לצאת משוער + דקות המתנה. זהו חישוב משוער ולא זמן הלכתי מוסמך; יש לוודא התאמה למנהג הקבוצה. שבת וחג רצופים נשארים נעולים.',
  'users': '👮 ניהול משתמשים: הגיבו להודעה עם /warn [סיבה], /mute 30m [סיבה], /unmute, /ban [סיבה], /unban (לפי מזהה). /warnings בתגובה מציג אזהרות. /clean 50 מוחק הודעות אחרונות שנצפו.',
  'replies': '🤖 תגובות: הגדירו טריגר, מצב exact או contains, טקסט וכפתורים. ההודעה המקורית והתגובה נשארות.',
- 'announcements': '📢 הודעות אוטומטיות: הודעות חוזרות לפי מרווח דקות. בזמן נעילה הן מושהות ולא נשלחות באיחור.',
+ 'announcements': '📢 הודעות אוטומטיות: לחץ על ״הוספת פרסום אוטומטי מודרך״, הגדר מרווח בדקות (למשל 180 = 3 שעות), הזן הודעה ואשר. דרך הרשימה אפשר לערוך, למחוק, להשהות ולהגדיר מחיקת הודעה קודמת. בזמן נעילה הפרסומים מושהים.',
  'verify': '✅ אימות: משתמש חדש מוגבל עד שילחץ על כפתור האימות. אין הרחקה אוטומטית. לאחר אימות תישלח ברכת הצטרפות.',
  'backup': '📦 /export בקבוצה או /export <group_id> בפרטי. שלחו את קובץ JSON לקבוצה אחרת והגיבו לו עם /import. כל ההגדרות יוחלפו לאחר אישור.',
  'channels': '📣 הודעות בשם ערוץ: הפעלה מוחקת הודעות שנשלחו בשם ערוץ או כערוץ מחובר, ולא הודעות רגילות של משתמשים. מנהלים יכולים לשנות בפרטי.',
@@ -580,6 +580,21 @@ def page_keyboard(cid,page):
     return kb(*rows)
 
 
+EDIT_PROMPTS = {
+    'daily_lock_time': '🔒 שעת נעילה יומית\nשלח שעה בפורמט HH:MM, למשל 00:42.\nהפעל גם את המתג ״נעילה יומית״.\n/cancel לביטול.',
+    'daily_unlock_time': '🔓 שעת פתיחה יומית\nשלח שעה בפורמט HH:MM, למשל 07:00.\n/cancel לביטול.',
+    'friday_time': '🕯️ שעת נעילה ביום שישי\nשלח שעה בפורמט HH:MM, למשל 13:00.\n/cancel לביטול.',
+    'holiday_time': '🕯️ שעת נעילה בערב חג\nשלח שעה בפורמט HH:MM, למשל 14:00.\n/cancel לביטול.',
+    'welcome_buttons': '🔘 שלח כל כפתור בשורה נפרדת: כותרת | https://example.com\n/cancel לביטול.',
+    'words': '🚫 שלח מילים אסורות מופרדות בפסיקים.\n/cancel לביטול.',
+    'welcome_media': '🖼️ שלח תמונה או סרטון, או ״מחק״ להסרת המדיה.\n/cancel לביטול.',
+}
+EDIT_NUMBER_LABELS = {'max_warn':'מכסת אזהרות','welcome_seconds':'זמן מחיקת ברכה בשניות','flood_count':'מספר הודעות','flood_seconds':'חלון זמן בשניות','flood_mute':'משך השתקה בשניות','word_mute':'משך השתקה בשניות','end_offset':'דקות המתנה אחרי צאת','nightfall_minutes':'דקות אחרי שקיעה'}
+def edit_prompt(key):
+    if key in EDIT_PROMPTS:return EDIT_PROMPTS[key]
+    if key in EDIT_NUMBER_LABELS:return f'🔢 {EDIT_NUMBER_LABELS[key]}\nשלח מספר שלם.\n/cancel לביטול.'
+    return f'✏️ עריכת {key}\nשלח את הטקסט החדש.\n/cancel לביטול.'
+
 async def callbacks(update,context):
     q=update.callback_query;uid=q.from_user.id
     try:action,value,cs=q.data.split(':',2);cid=int(cs)
@@ -815,7 +830,7 @@ async def callbacks(update,context):
         with conn() as c:
             c.execute('INSERT OR REPLACE INTO pending_edits(uid,chat,field) VALUES (?,?,?)',(uid,cid,value));c.commit()
         await q.answer()
-        await context.bot.send_message(uid,f'✏️ הגדרה: {value}\nשלח את הערך החדש בהודעה הבאה בפרטי.\nלכפתורים: שורה לכל כפתור בפורמט: כותרת | https://example.com\nלמילים אסורות: רשימה מופרדת בפסיקים.\nלתגובה חדשה: טריגר | exact/contains | טקסט\nלהודעה חוזרת: דקות | טקסט\nשלח /cancel לביטול.')
+        await context.bot.send_message(uid,edit_prompt(value))
         return
     if action=='show':
         await q.answer();data=cfg(cid).get(value,[])
@@ -1402,11 +1417,16 @@ async def periodic(context):
         await calendar_tick(context.bot,cid,g,d,now)
         # Daily schedules, fixed Jerusalem local time. Prevent repeated execution in same minute.
         hm=now.strftime('%H:%M')
-        if d['daily_lock'] and hm==d['daily_lock_time'] and not g['locked']:
-            await change_lock(context.bot,cid,True,'manual')
-        if d['daily_lock'] and hm==d['daily_unlock_time'] and g['locked'] and g['lock_reason']=='manual':
-            await change_lock(context.bot,cid,False,'manual')
-        if g['locked']:continue
+        if d['daily_lock'] and d['daily_lock_time'] != d['daily_unlock_time']:
+            # Desired state based on Israel local clock; survives missed ticks and restarts.
+            start,end=d['daily_lock_time'],d['daily_unlock_time']
+            should_lock = (start <= hm < end) if start < end else (hm >= start or hm < end)
+            current=get_group(cid)
+            if should_lock and not current['locked']:
+                await change_lock(context.bot,cid,True,'daily')
+            elif not should_lock and current['locked'] and current['lock_reason']=='daily':
+                await change_lock(context.bot,cid,False,'daily')
+        if get_group(cid)['locked']:continue
         changed=False
         for item in d['announcements']:
             if item.get('enabled',True) is False:continue

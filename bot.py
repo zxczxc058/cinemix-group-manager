@@ -51,7 +51,7 @@ HELP = {
  'welcome': '👋 ברוכים הבאים: הגדירו טקסט, כפתורים, תמונה/וידאו וזמן מחיקה. ההודעה החדשה מחליפה את הקודמת. {user} יוצר תיוג לחיץ.',
  'flood': '🛡️ אנטי ספאם: בחרו מספר הודעות, חלון זמן ומשך השתקה בשניות. עודף הודעות נמחק וגורר השתקה.',
  'words': '🚫 מילים אסורות: הגדירו רשימה מופרדת בפסיקים ובחרו פעולה: delete / warn / mute / ban.',
- 'lock': '🔒 נעילה: שומרת את הרשאות ברירת המחדל של הקבוצה ומחזירה אותן בפתיחה. /lock ו-/unlock בקבוצה. ניתן להגדיר נעילה יומית.',
+ 'lock': '🔒 נעילה: שומרת את הרשאות ברירת המחדל של הקבוצה ומחזירה אותן בפתיחה. /lock ו-/unlock בקבוצה. להפעלה יומית לחצו על 🔴 נעילה יומית: כבויה כדי להפוך ל־🟢 פעילה, והגדירו שעות נעילה ופתיחה לפי שעון ישראל (כולל אחרי חצות).',
  'calendar': '🕯️ שבת וחג: נעילה בשעה קבועה ביום שישי או בערב חג לפי לוח ישראל. פתיחה לפי שקיעה בירושלים + דקות לצאת משוער + דקות המתנה. זהו חישוב משוער ולא זמן הלכתי מוסמך; יש לוודא התאמה למנהג הקבוצה. שבת וחג רצופים נשארים נעולים.',
  'users': '👮 ניהול משתמשים: הגיבו להודעה עם /warn [סיבה], /mute 30m [סיבה], /unmute, /ban [סיבה], /unban (לפי מזהה). /warnings בתגובה מציג אזהרות. /clean 50 מוחק הודעות אחרונות שנצפו.',
  'replies': '🤖 תגובות: הגדירו טריגר, מצב exact או contains, טקסט וכפתורים. ההודעה המקורית והתגובה נשארות.',
@@ -560,7 +560,7 @@ def page_keyboard(cid,page):
     if page=='lock':
         rows.extend([[('🔒 נעל עכשיו',f'lock:manual:{cid}'),('🔓 פתח עכשיו',f'unlock:manual:{cid}')],
                      [('✏️ הודעת נעילה',f'edit:lock_text:{cid}')],[('✏️ הודעת פתיחה',f'edit:unlock_text:{cid}')],
-                     [('⏰ נעילה יומית',f'toggle:daily_lock:{cid}')],
+                     [('🟢 נעילה יומית: פעילה' if d['daily_lock'] else '🔴 נעילה יומית: כבויה',f'toggle:daily_lock:{cid}')],
                      [('🕐 שעת נעילה יומית',f'edit:daily_lock_time:{cid}')],
                      [('🕐 שעת פתיחה יומית',f'edit:daily_unlock_time:{cid}')]])
     if page=='calendar':
@@ -570,7 +570,7 @@ def page_keyboard(cid,page):
                      [('🌇 דקות אחרי שקיעה לצאת משוער',f'edit:nightfall_minutes:{cid}')]])
         for key,label in [('shabbat_lock_text','הודעת כניסת שבת'),('shabbat_unlock_text','הודעת צאת שבת'),('holiday_lock_text','הודעת כניסת חג'),('holiday_unlock_text','הודעת צאת חג')]:rows.append([(label,f'edit:{key}:{cid}')])
     if page=='replies':rows.extend([[('➕ הוספת תגובה מודרכת',f'wiz:reply:{cid}')],[('📋 רשימת תגובות / עריכה / מחיקה',f'show:replies:{cid}')]])
-    if page=='announcements':rows.extend([[('➕ פרסום אוטומטי מודרך',f'wiz:announcement:{cid}')],[('📋 רשימה / עריכה / מחיקה',f'show:announcements:{cid}')]])
+    if page=='announcements':rows.extend([[('➕ הודעה חוזרת כל X דקות/שעות',f'wiz:announcement:{cid}')],[('📋 רשימה / עריכה / מחיקה',f'show:announcements:{cid}')]])
     if page=='allowlist':rows.append([('📋 רשימת מורשים',f'show:allowlist:{cid}')])
     if page=='backup':
         rows.append([('📤 ייצוא הגדרות',f'export:x:{cid}')])
@@ -581,7 +581,7 @@ def page_keyboard(cid,page):
 
 
 EDIT_PROMPTS = {
-    'daily_lock_time': '🔒 שעת נעילה יומית\nשלח שעה בפורמט HH:MM, למשל 00:42.\nהפעל גם את המתג ״נעילה יומית״.\n/cancel לביטול.',
+    'daily_lock_time': '🔒 שעת נעילה יומית\nשלח שעה בפורמט HH:MM, למשל 00:42.\nודא שהכפתור ״נעילה יומית״ מופעל.\n/cancel לביטול.',
     'daily_unlock_time': '🔓 שעת פתיחה יומית\nשלח שעה בפורמט HH:MM, למשל 07:00.\n/cancel לביטול.',
     'friday_time': '🕯️ שעת נעילה ביום שישי\nשלח שעה בפורמט HH:MM, למשל 13:00.\n/cancel לביטול.',
     'holiday_time': '🕯️ שעת נעילה בערב חג\nשלח שעה בפורמט HH:MM, למשל 14:00.\n/cancel לביטול.',
@@ -819,8 +819,13 @@ async def callbacks(update,context):
     if action=='help':await q.answer();await q.message.reply_text(HELP.get(value,''));return
     if action=='toggle':
         if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock'):await q.answer('לא נתמך');return
-        set_cfg(cid,value,not cfg(cid)[value]);await q.answer('נשמר')
-        await q.message.reply_text('✅ ההגדרה עודכנה.',reply_markup=menu(cid));return
+        new_state=not cfg(cid)[value]
+        set_cfg(cid,value,new_state);await q.answer('נשמר')
+        if value=='daily_lock':
+            await q.message.reply_text(('🟢 הנעילה היומית הופעלה.' if new_state else '🔴 הנעילה היומית כובתה.')+'\nהזמנים לפי שעון ישראל.',reply_markup=page_keyboard(cid,'lock'))
+        else:
+            await q.message.reply_text('✅ ההגדרה עודכנה.',reply_markup=menu(cid))
+        return
     if action=='cycle' and value=='word_action':
         opts=['delete','warn','mute','ban'];cur=cfg(cid)['word_action'];set_cfg(cid,'word_action',opts[(opts.index(cur)+1)%len(opts)]);await q.answer('נשמר');return
     if action=='edit':
@@ -1412,7 +1417,7 @@ async def periodic(context):
         with conn() as c:c.execute('DELETE FROM welcomes WHERE chat=? AND mid=?',(item['chat'],item['mid']));c.commit()
     for g in all_groups():
         cid=g['id']
-        if not g['approved']:continue
+        if not g['approved'] or not g['active']:continue
         d=cfg(cid)
         await calendar_tick(context.bot,cid,g,d,now)
         # Daily schedules, fixed Jerusalem local time. Prevent repeated execution in same minute.
@@ -1425,6 +1430,10 @@ async def periodic(context):
             if should_lock and not current['locked']:
                 await change_lock(context.bot,cid,True,'daily')
             elif not should_lock and current['locked'] and current['lock_reason']=='daily':
+                await change_lock(context.bot,cid,False,'daily')
+        elif not d['daily_lock']:
+            current=get_group(cid)
+            if current['locked'] and current['lock_reason']=='daily':
                 await change_lock(context.bot,cid,False,'daily')
         if get_group(cid)['locked']:continue
         changed=False
@@ -1487,7 +1496,7 @@ def main():
     for command in group_commands:app.add_handler(CommandHandler(command,commands,filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,moderate))
     app.add_error_handler(error_handler)
-    if app.job_queue:app.job_queue.run_repeating(periodic,interval=60,first=15)
+    if app.job_queue:app.job_queue.run_repeating(periodic,interval=20,first=5,job_kwargs={'max_instances':1,'coalesce':True})
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

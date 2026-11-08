@@ -45,7 +45,7 @@ DEFAULT = {
  'holiday_unlock_text': '🌟 חג שמח! הקבוצה נפתחה.',
  'daily_lock': False, 'daily_lock_time': '23:00', 'daily_unlock_time': '07:00',
  'replies': [], 'announcements': [], 'allowlist': [], 'default_lock': False,
-  'stealth': False, 'forward_filter': 'allow', 'rules_text': '', 'rules_welcome_button': False,
+  'stealth': False, 'forward_filter': 'allow', 'rules_text': '', 'rules_popup_custom': '', 'rules_welcome_button': False,
   'trusted': [], 'milestones': False, 'milestone_step': 100, 'milestone_text': '🎉 הגענו ל־{count} חברים!',
 }
 HELP = {
@@ -877,7 +877,7 @@ FIELD_PAGES = {
     'holiday_lock_text':'calendar','holiday_unlock_text':'calendar',
     'verify':'verify','verify_text':'verify','rules_welcome_button':'welcome','service_delete':'service','channel_posts_delete':'channels',
     'stealth':'stealth','forward_filter':'forward','rules_text':'rules',
-    'delete_slash_commands':'command_cleanup',
+    'delete_slash_commands':'command_cleanup','rules_popup_custom':'rules',
 }
 
 def settings_page_text(page):
@@ -905,7 +905,7 @@ def page_keyboard(cid,page):
         key=toggles[page];rows.append([('🟢 פעיל' if d[key] else '🔴 כבוי',f'toggle:{key}:{cid}')])
     if page=='stealth':rows.append([('🟢 מצב סמוי פעיל' if d['stealth'] else '🔴 מצב סמוי כבוי',f'toggle:stealth:{cid}')])
     if page=='forward':rows.append([('🔄 מצב: '+d['forward_filter'],f'cycle:forward_filter:{cid}')])
-    if page=='rules':rows.extend([[('✏️ עריכת חוקי קבוצה',f'edit:rules_text:{cid}')],[('📢 פרסום החוקים',f'rulespublish:x:{cid}')]])
+    if page=='rules':rows.extend([[('✏️ עריכת חוקי קבוצה',f'edit:rules_text:{cid}')],[('✏️ עריכת הודעה מוקפצת',f'edit:rules_popup_custom:{cid}')],[('👁️ תצוגה מקדימה לחלונית',f'rulespreview:x:{cid}')],[('🔄 שימוש בחוקים המקוריים',f'rulesreset:x:{cid}')],[('📢 פרסום החוקים',f'rulespublish:x:{cid}')]])
     if page=='simulator':rows.append([('🧪 שלח הודעה לבדיקה',f'simstart:x:{cid}')])
     if page=='audit':rows.append([('📋 20 פעולות אחרונות',f'auditshow:x:{cid}')])
     if page=='command_cleanup':rows.append([('🟢 פעיל' if d['delete_slash_commands'] else '🔴 כבוי',f'toggle:delete_slash_commands:{cid}')])
@@ -1150,7 +1150,8 @@ async def callbacks(update,context):
     if not g['approved'] and uid!=OWNER:
         await q.answer('הקבוצה ממתינה לאישור בעל הבוט.',show_alert=True);return
     if action=='rulespopup':
-        await q.answer(rules_popup_text(cfg(cid).get('rules_text','')),show_alert=True)
+        d=cfg(cid)
+        await q.answer(rules_popup_text(d.get('rules_popup_custom') or d.get('rules_text','')),show_alert=True)
         return
     if action=='verify':
         if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
@@ -1166,6 +1167,15 @@ async def callbacks(update,context):
         return
     if not await authorized(context.bot,uid,cid):
         await q.answer('אין הרשאה',show_alert=True);return
+    if action=='rulespreview':
+        d=cfg(cid)
+        await q.answer(rules_popup_text(d.get('rules_popup_custom') or d.get('rules_text','')),show_alert=True)
+        return
+    if action=='rulesreset':
+        set_cfg(cid,'rules_popup_custom','')
+        await q.answer('החלונית משתמשת שוב בחוקים המקוריים')
+        await refresh_settings(q,cid,'rules','✅ ההודעה המותאמת אופסה')
+        return
     if uid!=OWNER and meta_get('maintenance','0')=='1' and action not in ('open','page','help','stats','health','show'):
         await q.answer('🛠️ הבוט נמצא בתחזוקה. שינוי הגדרות אינו זמין כרגע.',show_alert=True);return
     if action=='wiz':
@@ -1566,6 +1576,13 @@ async def input_private(update,context):
                 name,url=line.split('|',1);name=name.strip();url=url.strip()
                 assert url.startswith(('https://','http://','tg://'))
                 val.append({'text':name,'url':url})
+        elif key=='rules_popup_custom':
+            val=message_formatted(update.message).strip()
+            assert val and len(rules_popup_text(val))<=200
+            # Reject oversize input instead of silently truncating a custom popup.
+            import re as _re
+            plain=_re.sub(r'<[^>]+>', '', val[5:] if val.startswith('HTML:') else val).strip()
+            assert len(plain)<=200
         elif key=='words':val=[x.strip().lower() for x in raw.split(',') if x.strip()]
         elif key=='welcome_media':
             if update.message.photo:val={'type':'photo','id':update.message.photo[-1].file_id}

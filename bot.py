@@ -473,6 +473,31 @@ def regular_start_text():
     return r['val'] if r else '🛡️ ברוכים הבאים לבוט CINEMIX לניהול קבוצות!'
 
 
+# Owner-managed explanations. Missing overrides retain the original wording.
+EXPLANATION_LABELS = {
+    'links':'🔗 קישורים', 'welcome':'👋 ברוכים הבאים', 'flood':'🛡️ אנטי ספאם',
+    'words':'🚫 מילים אסורות', 'lock':'🔒 נעילה', 'calendar':'🕯️ שבת וחג',
+    'users':'👮 משתמשים', 'replies':'🤖 תגובות', 'announcements':'📢 הודעות חוזרות',
+    'verify':'✅ אימות', 'backup':'📦 גיבוי', 'channels':'📣 הודעות ערוץ',
+    'allowlist':'🛡️ מורשים', 'stealth':'🕵️ מנהל סמוי',
+    'forward':'🔄 הודעות מועברות', 'trusted':'⭐ משתמשים מהימנים',
+}
+EXPLANATION_SPECIAL = {
+    'stealth': ('🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, '
+                'ואז שלח את התשובה לבוט בפרטי.\n\nפקודות: /warn, /mute 30m, /ban, /unmute.'),
+    'forward': '🔄 סינון הודעות מועברות: allow = מותר; channels = מערוצים; all = הכול.',
+    'trusted': '⭐ משתמשים מהימנים: /allow בתגובה להודעה, /unallow להסרה.',
+}
+
+def explanation_text(key):
+    return meta_get('explanation_override:'+key, '') or EXPLANATION_SPECIAL.get(key,HELP.get(key,''))
+
+def explanation_picker():
+    items=list(EXPLANATION_LABELS.items())
+    rows=[[ (EXPLANATION_LABELS[k],f'ownerexplain:view:{k}') ] for k in EXPLANATION_LABELS]
+    rows.append([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
+    return kb(*rows)
+
 def owner_menu():
     return kb(
         [('📊 תמונת מצב', 'owner:overview:0'),('👥 כל הקבוצות','list:all:0')],
@@ -480,6 +505,7 @@ def owner_menu():
         [('📣 פרסום מרכזי','owner:broadcast:0'),('📈 פעילות מערכת','owner:metrics:0')],
         [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
         [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
+         [('📝 ניהול הסברים והודעות מערכת','owner:explanations:0')],
          [('📖 מדריך','guide:all:0')])
 
 
@@ -523,6 +549,9 @@ async def owner_dashboard(bot,recipient,section):
         active=meta_get('maintenance','0')=='1'
         msg=f'🛠️ מצב תחזוקה: {"פעיל" if active else "כבוי"}\n\nבעת תחזוקה מנהלים לא יכולים לשנות הגדרות. ההגנות ונעילות הקבוצות ממשיכות לפעול.\nהודעת התחזוקה נשלחת לקבוצות המאושרות ולמנהלים שניתן לפנות אליהם בפרטי.'
         await panel_update(bot,recipient,msg,reply_markup=kb([('🟢 הפעל תחזוקה' if not active else '🔴 סיים תחזוקה','ownermaintenance:toggle:0')],[('✏️ ערוך הודעת תחזוקה','ownermaintenance:text:0')],[('⬅️ חזרה','owner:overview:0')]))
+        return
+    elif section=='explanations':
+        await panel_update(bot,recipient,'📝 ניהול הסברים והודעות מערכת\n\nבחר הסבר לעריכה. כל הסבר שלא שינית נשאר בנוסח המקורי.',reply_markup=explanation_picker())
         return
     elif section=='start':
         msg='📝 הודעת הפתיחה הנוכחית:\n\n'+regular_start_text()[:2500]+'\n\nלשינוי: /setstart'
@@ -691,13 +720,8 @@ FIELD_PAGES = {
 }
 
 def settings_page_text(page):
-    if page=='stealth':
-        return ('🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, '
-                'ואז שלח את התשובה לבוט בפרטי.\n\nפקודות: /warn, /mute 30m, /ban, /unmute.')
-    if page=='forward':
-        return '🔄 סינון הודעות מועברות: allow = מותר; channels = מערוצים; all = הכול.'
-    if page=='trusted':
-        return '⭐ משתמשים מהימנים: /allow בתגובה להודעה, /unallow להסרה.'
+    if page in EXPLANATION_LABELS:
+        return explanation_text(page)
     return HELP.get(page,'⚙️ הגדרות הקבוצה — בחר פעולה:')
 
 async def refresh_settings(query,cid,page,notice=''):
@@ -778,6 +802,22 @@ async def callbacks(update,context):
         panel_remember(uid,q.message.chat_id,q.message.message_id)
     try:action,value,cs=q.data.split(':',2);cid=int(cs)
     except Exception:await q.answer('שגיאה');return
+    if action=='ownerexplain':
+        if uid!=OWNER or q.message.chat.type!='private':
+            await q.answer('רק בעל הבוט',show_alert=True);return
+        key=cs
+        if key not in EXPLANATION_LABELS:
+            await q.answer('הסבר לא נמצא',show_alert=True);return
+        await q.answer()
+        if value=='view':
+            await panel_from_query(q,'📝 '+EXPLANATION_LABELS[key]+'\n\n'+explanation_text(key)[:3400],
+                reply_markup=kb([('✏️ עריכת ההסבר',f'ownerexplain:edit:{key}')],
+                                [('⬅️ לכל ההסברים','owner:explanations:0')]))
+        elif value=='edit':
+            pending_set(uid,0,'owner_explanation:'+key)
+            await panel_from_query(q,'✏️ עריכת הסבר: '+EXPLANATION_LABELS[key]+'\n\nשלח עכשיו את הנוסח החדש בהודעה רגילה.\nהנוסח הקיים נשמר עד שתשלח שינוי. /cancel לביטול.',
+                reply_markup=kb([('⬅️ לכל ההסברים','owner:explanations:0')]))
+        return
     if action=='owner':
         if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
         await q.answer()
@@ -820,7 +860,7 @@ async def callbacks(update,context):
     if action=='guide':
         if uid!=OWNER and not any(g['approved'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
             await q.answer('אין הרשאה',show_alert=True);return
-        await q.answer();await panel_from_query(q,'📖 מדריך CINEMIX\n\n'+'\n\n'.join(HELP.values())[:3900]);return
+        await q.answer();await panel_from_query(q,'📖 מדריך CINEMIX\n\n'+'\n\n'.join(explanation_text(k) for k in HELP)[:3900]);return
     if action=='approval':
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
         if not get_group(cid):await q.answer('קבוצה לא נמצאה');return
@@ -1031,10 +1071,12 @@ async def callbacks(update,context):
         await q.answer();await panel_from_query(q,f'⚙️ {g["title"]}\nבחר הגדרה:',reply_markup=menu(cid));return
     if action=='page':
         await q.answer()
-        await panel_from_query(q,settings_page_text(value) if value!='guide' else '\n\n'.join(HELP.values())[:3900],
+        await panel_from_query(q,settings_page_text(value) if value!='guide' else '\n\n'.join(explanation_text(k) for k in HELP)[:3900],
                                    reply_markup=page_keyboard(cid,value) if value!='guide' else kb([('⬅️ חזרה להגדרות',f'open:x:{cid}')]))
         return
-    if action=='help':await q.answer();await panel_from_query(q,HELP.get(value,''));return
+    if action=='help':
+        await q.answer();await panel_from_query(q,explanation_text(value),reply_markup=kb([('⬅️ חזרה',f'page:{value}:{cid}')]))
+        return
     if action=='toggle':
         if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth'):await q.answer('לא נתמך');return
         new_state=not cfg(cid)[value]
@@ -1160,6 +1202,20 @@ async def input_private(update,context):
             d=cfg(cid);d['announcements'][index]['active_hours']=hours;save_cfg(cid,d);clear_pending(uid)
             await private_settings_result(update.message,cid,'announcements','✅ שעות הפעילות נשמרו')
         except (ValueError,IndexError,KeyError):await panel_from_input(update,context,'❌ שלח 09:00-23:00 או מחק')
+        return
+    if key.startswith('owner_explanation:'):
+        if uid!=OWNER:return
+        explain_key=key.split(':',1)[1]
+        if explain_key not in EXPLANATION_LABELS:
+            clear_pending(uid);return
+        value=(update.message.text or update.message.caption or '').strip()
+        if not value or len(value)>3500:
+            await panel_from_input(update,context,'❌ שלח הסבר באורך 1–3500 תווים.');return
+        meta_set('explanation_override:'+explain_key,value)
+        clear_pending(uid)
+        await panel_from_input(update,context,'✅ ההסבר נשמר!\n\n'+value,
+            reply_markup=kb([('✏️ עריכה נוספת',f'ownerexplain:edit:{explain_key}')],
+                            [('⬅️ לכל ההסברים','owner:explanations:0')]))
         return
     if key=='maintenance_text':
         if uid!=OWNER:return

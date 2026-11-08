@@ -101,6 +101,8 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS owner_backups (id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER, payload TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS member_counts (chat INTEGER PRIMARY KEY, last_count INTEGER DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS admin_panels (uid INTEGER PRIMARY KEY, chat INTEGER, mid INTEGER)')
+    c.execute('CREATE TABLE IF NOT EXISTS manager_grants (chat INTEGER NOT NULL, uid INTEGER NOT NULL, granted_at INTEGER NOT NULL, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS text_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text_key TEXT NOT NULL, old_value TEXT NOT NULL, changed_at INTEGER NOT NULL)')
     c.commit()
     return c
 
@@ -310,8 +312,21 @@ def buttons(rows):
 def kb(*rows): return K([[B(label,callback_data=data) for label,data in row] for row in rows])
 
 
+async def telegram_admin(bot,uid,cid):
+    if uid==OWNER:return True
+    try:
+        member=await bot.get_chat_member(cid,uid)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
+    except TelegramError:
+        return False
+
+
 async def authorized(bot,uid,cid):
     if uid==OWNER:return True
+    # A grant is bot-specific. It never grants Telegram administrator rights.
+    with conn() as c:
+        granted=c.execute('SELECT 1 FROM manager_grants WHERE chat=? AND uid=?',(cid,uid)).fetchone()
+    if granted:return True
     try:
         m=await bot.get_chat_member(cid,uid)
         return m.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
@@ -350,7 +365,7 @@ async def notify_owner(bot,cid):
         invitation=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
     who=f"\nמבקש: {invitation['inviter']}" if invitation else ''
     try:
-        await bot.send_message(OWNER,f'📥 בקשת אישור חדשה\n{g["title"]}\nID: {cid}{who}',reply_markup=kb([('✅ אישור',f'approval:1:{cid}'),('❌ דחייה',f'approval:0:{cid}')]))
+        await send_formatted(bot,OWNER,system_text('group_approval_requested',group=g['title'])+f'\nID: {cid}{who}',markup=kb([('✅ אישור',f'approval:1:{cid}'),('❌ דחייה',f'approval:0:{cid}')]))
     except TelegramError:
         log.exception('Owner notification failed for group %s',cid)
         return False
@@ -480,13 +495,14 @@ async def list_groups(bot,uid,cid):
         rows.append([('⚙️ '+g['title'][:45],f'open:x:{g["id"]}')])
         if uid==OWNER:rows.append([('❌ ביטול אישור' if g['approved'] else '✅ אישור',f'approval:{0 if g["approved"] else 1}:{g["id"]}')])
     if uid==OWNER:rows.append([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
+    else:rows.append([('⬅️ חזרה לתפריט המנהל','managerhome:show:0')])
     await panel_update(bot,uid,'👥 קבוצות לניהול — בחר קבוצה:',kb(*rows))
 
 
 def regular_start_text():
     with conn() as c:
         r=c.execute("SELECT val FROM meta WHERE key='regular_start_text'").fetchone()
-    return r['val'] if r else system_text('owner_welcome')
+    return r['val'] if r else (editable_text('system','regular_start') if meta_get('owner_text:system:regular_start','') else system_text('owner_welcome'))
 
 
 # Owner-managed explanations. Missing overrides retain the original wording.
@@ -531,6 +547,19 @@ SYSTEM_TEXTS = {
     'import_prompt':'השב לקובץ גיבוי JSON קטן מ־1MB עם /import',
     'stealth_disabled':'🕵️ הפעל תחילה מצב מנהל סמוי בפאנל הקבוצה.',
     'stealth_prompt':'💬 שלח כאן את התשובה שלך. היא תפורסם בקבוצה כתגובה להודעה המקורית, בשם הבוט. /cancel לביטול.',
+    'regular_start':'👋 ברוכים הבאים ל-CINEMIX! אם אתם מנהלי קבוצה, הוסיפו את הבוט לקבוצה והמתינו לאישור הבעלים.',
+    'manager_start':'👋 ברוך הבא, {name}! בחר קבוצה לניהול.',
+    'owner_start':'👑 ברוך הבא לפאנל הבעלים של CINEMIX.',
+    'no_permission':'⛔ אין לך הרשאה לבצע פעולה זו.',
+    'group_approval_requested':'📥 בקשת אישור חדשה לקבוצה {group}.',
+    'group_approval_cancelled':'❌ אישור הקבוצה בוטל.',
+    'group_locked':'🔒 הקבוצה ננעלה.',
+    'group_unlocked':'🔓 הקבוצה נפתחה.',
+    'group_warning':'⚠️ נרשמה אזהרה למשתמש.',
+    'group_muted':'🔇 המשתמש הושתק.',
+    'group_banned':'🚫 המשתמש הורחק.',
+    'system_error':'⚠️ הפעולה לא הושלמה. נסה שוב.',
+    'backup_ready':'💾 הגיבוי נוצר בהצלחה.',
 }
 SYSTEM_LABELS = {
     'owner_welcome':'הודעת פתיחה כללית', 'group_approved':'אישור קבוצה',
@@ -539,6 +568,21 @@ SYSTEM_LABELS = {
     'maintenance_end':'סיום תחזוקה', 'import_invalid':'גיבוי לא תקין',
     'import_prompt':'הנחיית ייבוא', 'stealth_disabled':'מנהל סמוי כבוי',
     'stealth_prompt':'הנחיית תגובה סמויה',
+    'regular_start':'פתיחה למשתמש רגיל', 'manager_start':'פתיחה למנהל',
+    'owner_start':'פתיחה לבעלים', 'no_permission':'חוסר הרשאה',
+    'group_approval_requested':'בקשת אישור חדשה', 'group_approval_cancelled':'ביטול אישור',
+    'group_locked':'הודעת נעילה', 'group_unlocked':'הודעת פתיחה',
+    'group_warning':'הודעת אזהרה', 'group_muted':'הודעת השתקה',
+    'group_banned':'הודעת הרחקה', 'system_error':'שגיאת מערכת',
+    'backup_ready':'גיבוי הוכן',
+}
+
+MESSAGE_CATEGORIES = {
+    'users': ('👤 הודעות משתמשים', ('regular_start','no_permission','owner_welcome')),
+    'managers': ('👮 הודעות מנהלים', ('manager_start','owner_start','stealth_disabled','stealth_prompt')),
+    'approvals': ('👥 הודעות אישור קבוצות', ('group_approval_requested','group_approved','group_rejected','group_approval_cancelled','approval_sent','approval_failed')),
+    'groups': ('🔒 הודעות ניהול קבוצות', ('group_warning','group_muted','group_banned','group_locked','group_unlocked')),
+    'system': ('⚙️ הודעות מערכת', ('maintenance_notice','maintenance_end','system_error','import_invalid','import_prompt','backup_ready')),
 }
 
 def editable_text(kind,key):
@@ -553,6 +597,13 @@ def explanation_enabled(kind,key):
     # Absence of a setting means enabled, preserving existing installations.
     return meta_get('owner_text_enabled:'+kind+':'+key,'1') != '0'
 
+def panel_rich(title, content):
+    # Telegram HTML formatting is preserved even when a panel adds its own heading.
+    if isinstance(content,str) and content.startswith('HTML:'):
+        return 'HTML:'+html.escape(title)+'\n\n'+content[5:]
+    return title+'\n\n'+str(content)
+
+
 def owner_explanation_menu(key):
     return kb([('✏️ הסבר קצר',f'ownertext:view:short,{key}')],
               [('📖 הסבר שימוש מפורט',f'ownertext:view:detail,{key}')],
@@ -561,8 +612,28 @@ def owner_explanation_menu(key):
 def explanation_text(key):
     return editable_text('detail',key) if explanation_enabled('detail',key) else ''
 
-def system_text(key):
-    return editable_text('system',key)
+def system_text(key, **values):
+    result=editable_text('system',key)
+    for name,value in values.items():
+        if name in ('name','group','user'):
+            replacement=html.escape(str(value)) if result.startswith('HTML:') else str(value)
+            result=result.replace('{'+name+'}',replacement)
+    return result
+
+
+def record_text_revision(kind, key):
+    # Existing custom text is preserved, and previous revisions are recoverable.
+    current=editable_text(kind,key)
+    with conn() as c:
+        c.execute('INSERT INTO text_revisions(kind,text_key,old_value,changed_at) VALUES (?,?,?,?)',
+                  (kind,key,current,int(time.time())))
+        c.execute('DELETE FROM text_revisions WHERE id IN (SELECT id FROM text_revisions WHERE kind=? AND text_key=? ORDER BY id DESC LIMIT -1 OFFSET 15)',(kind,key))
+        c.commit()
+
+
+def formatted_system_message(key, **values):
+    return system_text(key, **values)
+
 
 def explanation_picker():
     rows=[[ (EXPLANATION_LABELS[k],f'ownerexplain:select:{k}') ] for k in EXPLANATION_LABELS]
@@ -578,6 +649,7 @@ def owner_text_actions(kind,key):
     if kind in ('short','detail'):
         enabled=explanation_enabled(kind,key)
         rows.append([(('🔴 השבתת ההסבר' if enabled else '🟢 הפעלת ההסבר'),f'ownertext:toggle:{kind},{key}')])
+    rows.append([('🕘 היסטוריית נוסחים',f'ownertext:history:{kind},{key}')])
     rows.append([('🔄 חזרה לברירת מחדל',f'ownertext:reset:{kind},{key}')])
     rows.append([('⬅️ חזרה',f'ownerexplain:{"systems" if kind=="system" else "select"}:{"0" if kind=="system" else key}')])
     status=('\n\nמצב: '+('🟢 פעיל' if explanation_enabled(kind,key) else '🔴 מושבת')) if kind in ('short','detail') else ''
@@ -590,6 +662,7 @@ def owner_menu():
         [('📣 פרסום מרכזי','owner:broadcast:0'),('📈 פעילות מערכת','owner:metrics:0')],
         [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
         [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
+        [('👥 הרשאות ניהול','managergrants:list:0'),('💬 ניהול הודעות הבוט','botmessages:categories:0')],
          [('📝 ניהול הסברים והודעות מערכת','owner:explanations:0')],
          [('📖 מדריך','guide:all:0')])
 
@@ -685,10 +758,15 @@ async def start(update,context):
     if update.effective_user.id==OWNER:
         await owner_panel(update,context)
     else:
-        # Ordinary users only see the owner's welcome message, not management menus.
-        with conn() as c:
-            r=c.execute('SELECT COUNT(*) FROM invitations i JOIN groups g ON g.id=i.chat WHERE i.inviter=? AND g.approved=0 AND g.active=1',(update.effective_user.id,)).fetchone()
-        await update.message.reply_text('✅ הבקשה נשלחה לבעלים לאישור.' if r[0] else regular_start_text())
+        uid=update.effective_user.id
+        available=[g for g in all_groups() if g['approved'] and g['active'] and await authorized(context.bot,uid,g['id'])]
+        if available:
+            await panel_new(context.bot,uid)
+            await panel_update(context.bot,uid,system_text('manager_start',name=update.effective_user.full_name),reply_markup=kb([('👥 ניהול הקבוצות שלי','list:mine:0')]))
+        else:
+            with conn() as c:
+                r=c.execute('SELECT COUNT(*) FROM invitations i JOIN groups g ON g.id=i.chat WHERE i.inviter=? AND g.approved=0 AND g.active=1',(uid,)).fetchone()
+            await send_formatted(context.bot,uid,system_text('approval_sent') if r[0] else regular_start_text())
 
 
 async def manage(update,context):
@@ -710,7 +788,7 @@ async def manage(update,context):
             await panel_new(context.bot,uid)
             await list_groups(context.bot,uid,chat.id)
         else:
-            await panel_update(context.bot,OWNER,regular_start_text())
+            await send_formatted(context.bot,uid,system_text('no_permission'))
 
 
 async def groups_cmd(update,context):
@@ -916,6 +994,115 @@ async def callbacks(update,context):
         cid=0 if action in ('ownerexplain','ownertext') else int(cs)
     except Exception:
         await q.answer('שגיאה');return
+    if action=='managerhome':
+        await q.answer()
+        if q.message.chat.type!='private':return
+        if uid!=OWNER and not any(g['approved'] and g['active'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
+            await panel_from_query(q,system_text('no_permission'));return
+        await panel_from_query(q,system_text('manager_start',name=q.from_user.full_name),reply_markup=kb([('👥 ניהול הקבוצות שלי','list:mine:0')]))
+        return
+    if action=='botmessages':
+        if uid!=OWNER or q.message.chat.type!='private':
+            await q.answer('רק בעל הבוט',show_alert=True);return
+        await q.answer()
+        if value=='categories':
+            rows=[[(label,f'botmessages:category_{key}:0')] for key,(label,keys) in MESSAGE_CATEGORIES.items()]
+            rows.append([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
+            await panel_from_query(q,'💬 ניהול הודעות הבוט\nבחר קטגוריה:',reply_markup=kb(*rows))
+            return
+        if value.startswith('category_'):
+            cat=value[len('category_'):]
+            if cat not in MESSAGE_CATEGORIES:return
+            label,keys=MESSAGE_CATEGORIES[cat]
+            rows=[[(SYSTEM_LABELS[key],f'botmessages:message_{key}:0')] for key in keys]
+            rows.append([('⬅️ כל הקטגוריות','botmessages:categories:0')])
+            await panel_from_query(q,label+'\nבחר הודעה:',reply_markup=kb(*rows))
+            return
+        if value.startswith('message_'):
+            key=value[len('message_'):]
+            if key not in SYSTEM_TEXTS:return
+            text=editable_text('system',key)
+            category=next((k for k,(_,keys) in MESSAGE_CATEGORIES.items() if key in keys),'system')
+            rows=kb([('✏️ עריכה',f'ownertext:edit:system,{key}')],
+                    [('👁️ תצוגה מקדימה',f'botmessages:preview_{key}:0')],
+                    [('🕘 היסטוריית נוסחים',f'botmessages:history_{key}:0')],
+                    [('🔄 שחזור ברירת מחדל',f'ownertext:reset:system,{key}')],
+                    [('⬅️ חזרה לקטגוריה',f'botmessages:category_{category}:0')])
+            await panel_from_query(q,panel_rich('💬 '+SYSTEM_LABELS[key],text[:3200]),reply_markup=rows)
+            return
+        if value.startswith('history_'):
+            key=value[len('history_'):]
+            if key not in SYSTEM_TEXTS:return
+            with conn() as c:
+                history=c.execute('SELECT id,changed_at FROM text_revisions WHERE kind=? AND text_key=? ORDER BY id DESC LIMIT 10',('system',key)).fetchall()
+            rows=[[('🕘 '+datetime.fromtimestamp(r['changed_at'],TZ).strftime('%d/%m %H:%M')+' (#'+str(r['id'])+')',f'botmessages:revision_{r["id"]}:0')] for r in history]
+            rows.append([('⬅️ חזרה להודעה',f'botmessages:message_{key}:0')])
+            await panel_from_query(q,'🕘 היסטוריית נוסחים - '+SYSTEM_LABELS[key]+'\nבחר גרסה לצפייה ולשחזור:',reply_markup=kb(*rows))
+            return
+        if value.startswith('revision_'):
+            rid=int(value[len('revision_'):])
+            with conn() as c:
+                revision=c.execute('SELECT kind,text_key,old_value FROM text_revisions WHERE id=?',(rid,)).fetchone()
+            if not revision or revision['kind']!='system':return
+            key=revision['text_key']
+            await panel_from_query(q,panel_rich('🕘 נוסח קודם - '+SYSTEM_LABELS[key],revision['old_value'][:3000]),reply_markup=kb([('♻️ שחזר נוסח זה',f'botmessages:restore_{rid}:0')],[('⬅️ חזרה להיסטוריה',f'botmessages:history_{key}:0')]))
+            return
+        if value.startswith('restore_'):
+            rid=int(value[len('restore_'):])
+            with conn() as c:
+                revision=c.execute('SELECT kind,text_key,old_value FROM text_revisions WHERE id=?',(rid,)).fetchone()
+            if not revision or revision['kind']!='system':return
+            key=revision['text_key']
+            record_text_revision('system',key)
+            meta_set('owner_text:system:'+key,revision['old_value'])
+            await panel_from_query(q,'✅ הנוסח הקודם שוחזר. הטקסט שהיה לפני השחזור נשמר בהיסטוריה.',reply_markup=kb([('⬅️ חזרה להודעה',f'botmessages:message_{key}:0')]))
+            return
+        if value.startswith('preview_'):
+            key=value[len('preview_'):]
+            if key not in SYSTEM_TEXTS:return
+            txt=editable_text('system',key)
+            # Render placeholders in preview without changing the stored template.
+            txt=txt.replace('{group}','קבוצת דוגמה').replace('{name}','משתמש לדוגמה').replace('{user}','משתמש לדוגמה')
+            await panel_from_query(q,panel_rich('👁️ תצוגה מקדימה',txt[:3200]),reply_markup=kb([('⬅️ חזרה להודעה',f'botmessages:message_{key}:0')]))
+            return
+        return
+    if action=='managergrants':
+        if uid!=OWNER or q.message.chat.type!='private':
+            await q.answer('רק בעל הבוט',show_alert=True);return
+        await q.answer()
+        if value=='list':
+            rows=[[('👥 '+g['title'][:40],f'managergrants:group:{g["id"]}')] for g in all_groups() if g['approved'] and g['active']]
+            rows.append([('⬅️ חזרה','owner:overview:0')])
+            await panel_from_query(q,'👥 הרשאות ניהול דרך הבוט\nבחר קבוצה. הרשאות אלו אינן משנות את תפקיד המשתמש בטלגרם.',reply_markup=kb(*rows))
+            return
+        if value=='group':
+            g=get_group(cid)
+            if not g:return
+            with conn() as c:
+                users=c.execute('SELECT uid FROM manager_grants WHERE chat=? ORDER BY granted_at DESC',(cid,)).fetchall()
+            rows=[[('❌ הסר '+str(r['uid']),f'managergrants:remove_{r["uid"]}:{cid}')] for r in users[:50]]
+            rows.extend([[('➕ הוסף לפי מזהה משתמש',f'managergrants:add:{cid}')],[('👮 מנהלי טלגרם בקבוצה',f'managergrants:telegram:{cid}')],[('⬅️ לכל הקבוצות','managergrants:list:0')]])
+            await panel_from_query(q,'👥 מורשים לניהול דרך הבוט - '+g['title']+'\n'+('\n'.join(str(r['uid']) for r in users) if users else 'אין הרשאות נוספות.'),reply_markup=kb(*rows))
+            return
+        if value=='telegram':
+            try:
+                members=await context.bot.get_chat_administrators(cid)
+                names=['👑 '+m.user.full_name if m.status==ChatMemberStatus.OWNER else '👮 '+m.user.full_name for m in members]
+                msg='👮 מנהלי טלגרם בקבוצה\n\n'+'\n'.join(names)
+            except TelegramError:
+                msg='⚠️ לא ניתן לקבל כרגע את רשימת מנהלי טלגרם.'
+            await panel_from_query(q,msg,reply_markup=kb([('⬅️ חזרה להרשאות',f'managergrants:group:{cid}')]))
+            return
+        if value=='add':
+            pending_set(uid,cid,'manager_grant_add')
+            await panel_from_query(q,'➕ שלח את המזהה המספרי של המשתמש.\nההרשאה תהיה לניהול הקבוצה דרך הבוט בלבד.',reply_markup=kb([('⬅️ חזרה',f'managergrants:group:{cid}')]))
+            return
+        if value.startswith('remove_'):
+            target=int(value.partition('_')[2])
+            with conn() as c:
+                c.execute('DELETE FROM manager_grants WHERE chat=? AND uid=?',(cid,target));c.commit()
+            await panel_from_query(q,'✅ ההרשאה הוסרה.',reply_markup=kb([('⬅️ לרשימה',f'managergrants:group:{cid}')]))
+            return
     # An owner explanation editor must not keep an unrelated pending input.
     if action in ('ownerexplain','ownertext') and not (action=='ownertext' and value=='edit'):
         with conn() as c:
@@ -942,6 +1129,30 @@ async def callbacks(update,context):
         try:kind,key=cs.split(',',1)
         except ValueError:return
         if kind not in ('short','detail','system') or key not in (SYSTEM_TEXTS if kind=='system' else EXPLANATION_LABELS):return
+        if value=='history':
+            with conn() as c:
+                rows_data=c.execute('SELECT id,changed_at FROM text_revisions WHERE kind=? AND text_key=? ORDER BY id DESC LIMIT 10',(kind,key)).fetchall()
+            rows=[[('🕘 '+datetime.fromtimestamp(r['changed_at'],TZ).strftime('%d/%m %H:%M')+' (#'+str(r['id'])+')',f'ownertext:revision_{r["id"]}:{kind},{key}')] for r in rows_data]
+            rows.append([('⬅️ חזרה',f'ownertext:view:{kind},{key}')])
+            await panel_from_query(q,'🕘 היסטוריית נוסחים\nבחר גרסה לשחזור:',reply_markup=kb(*rows))
+            return
+        if value.startswith('revision_'):
+            rid=int(value[len('revision_'):])
+            with conn() as c:
+                r=c.execute('SELECT old_value FROM text_revisions WHERE id=? AND kind=? AND text_key=?',(rid,kind,key)).fetchone()
+            if not r:return
+            await panel_from_query(q,panel_rich('🕘 גרסה קודמת',r['old_value'][:3000]),reply_markup=kb([('♻️ שחזר',f'ownertext:restore_{rid}:{kind},{key}')],[('⬅️ חזרה להיסטוריה',f'ownertext:history:{kind},{key}')]))
+            return
+        if value.startswith('restore_'):
+            rid=int(value[len('restore_'):])
+            with conn() as c:
+                r=c.execute('SELECT old_value FROM text_revisions WHERE id=? AND kind=? AND text_key=?',(rid,kind,key)).fetchone()
+            if not r:return
+            record_text_revision(kind,key)
+            meta_set('owner_text:'+kind+':'+key,r['old_value'])
+            text,markup=owner_text_actions(kind,key)
+            await panel_from_query(q,'✅ הגרסה שוחזרה.\n\n'+text,reply_markup=markup)
+            return
         if value=='edit':
             pending_set(uid,0,'owner_text:'+kind+':'+key)
             await panel_from_query(q,'✏️ שלח טקסט חדש עבור '+(SYSTEM_LABELS[key] if kind=='system' else EXPLANATION_LABELS[key])+'.\n/cancel לביטול.',
@@ -950,6 +1161,7 @@ async def callbacks(update,context):
             if value=='toggle' and kind in ('short','detail'):
                 meta_set('owner_text_enabled:'+kind+':'+key,'0' if explanation_enabled(kind,key) else '1')
             if value=='reset':
+                record_text_revision(kind,key)
                 meta_set('owner_text:'+kind+':'+key,'')
                 if kind=='detail':meta_set('explanation_override:'+key,'')
             text,markup=owner_text_actions(kind,key)
@@ -1011,7 +1223,7 @@ async def callbacks(update,context):
         with conn() as c:
             c.execute('DELETE FROM group_requests WHERE chat=?',(cid,))
             c.commit()
-        decision=system_text('group_approved') if value=='1' else system_text('group_rejected')
+        decision=system_text('group_approved') if value=='1' else system_text('group_approval_cancelled')
         try:await send_formatted(context.bot,cid,decision)
         except TelegramError:log.warning('Cannot announce approval in %s',cid)
         with conn() as c:inv=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
@@ -1321,6 +1533,28 @@ async def input_private(update,context):
     cid,key=pending
     if meta_get('maintenance','0')=='1' and uid!=OWNER and key not in ('simulate',):
         await panel_from_input(update,context,'🛠️ הבוט בתחזוקה. לא ניתן לשנות הגדרות כעת.');return
+    if key=='manager_grant_add':
+        if uid!=OWNER:
+            clear_pending(uid);return
+        raw=(update.message.text or '').strip()
+        if not raw.isdigit() or int(raw)<=0:
+            await panel_from_input(update,context,'❌ שלח מזהה משתמש מספרי חיובי בלבד.')
+            return
+        g=get_group(cid)
+        if not g or not g['approved']:
+            clear_pending(uid);return
+        try:
+            member=await context.bot.get_chat_member(cid,int(raw))
+            if member.status not in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER,ChatMemberStatus.RESTRICTED):
+                await panel_from_input(update,context,'❌ המשתמש אינו חבר בקבוצה. לא נוספה הרשאה.');return
+        except TelegramError:
+            await panel_from_input(update,context,'❌ לא ניתן לאמת שהמשתמש חבר בקבוצה. לא נוספה הרשאה.');return
+        with conn() as c:
+            c.execute('INSERT OR REPLACE INTO manager_grants(chat,uid,granted_at) VALUES (?,?,?)',(cid,int(raw),int(time.time())))
+            c.commit()
+        clear_pending(uid)
+        await panel_from_input(update,context,'✅ נוספה הרשאת ניהול דרך הבוט למזהה '+raw+'\nהמשתמש צריך לפתוח את הבוט בפרטי.',reply_markup=kb([('⬅️ לרשימת המורשים',f'managergrants:group:{cid}')]))
+        return
     if key.startswith('wizard:'):
         await wizard_input(update,context,cid,key)
         return
@@ -1354,6 +1588,7 @@ async def input_private(update,context):
         value=message_formatted(update.message).strip()
         if not value or len(value)>3500:
             await panel_from_input(update,context,'❌ שלח טקסט באורך 1–3500 תווים.');return
+        record_text_revision(kind,text_key)
         meta_set('owner_text:'+kind+':'+text_key,value)
         clear_pending(uid)
         text,markup=owner_text_actions(kind,text_key)
@@ -1633,7 +1868,7 @@ async def service(update,context):
 
 async def warning(bot,cid,user,reason=''):
     d=cfg(cid);n=warn_count(cid,user.id,1);metric(cid,'warnings')
-    txt=f'⚠️ המשתמש {mention(user)}, זוהי אזהרה {n}/{d["max_warn"]}'
+    txt=render_text(system_text('group_warning'))+f'\n⚠️ המשתמש {mention(user)}, זוהי אזהרה {n}/{d["max_warn"]}'
     if reason:txt+=f'\n📋 סיבה: {html.escape(reason)}'
     if n>=d['max_warn']:
         try:
@@ -1654,7 +1889,7 @@ def duration(s):
 async def mute(bot,cid,user,seconds,reason=''):
     try:
         await bot.restrict_chat_member(cid,user.id,permissions=ChatPermissions(can_send_messages=False),until_date=datetime.now(TZ)+timedelta(seconds=max(31,seconds)))
-        txt=f'🔇 המשתמש {mention(user)} הושתק למשך {seconds//60} דקות.'
+        txt=render_text(system_text('group_muted'))+f'\n🔇 המשתמש {mention(user)} הושתק למשך {seconds//60} דקות.'
         if reason:txt+=f'\n📋 סיבה: {html.escape(reason)}'
         await bot.send_message(cid,txt,parse_mode=ParseMode.HTML,reply_markup=kb([('🔊 ביטול השתקה',f'unmute:{user.id}:{cid}')]))
     except TelegramError:log.exception('Mute failed')
@@ -1790,7 +2025,7 @@ async def commands(update,context):
     elif cmd=='ban':
         try:
             await context.bot.ban_chat_member(cid,target.id)
-            txt=f'🚫 המשתמש {mention(target)} הורחק מהקבוצה.'
+            txt=render_text(system_text('group_banned'))+f'\n🚫 המשתמש {mention(target)} הורחק מהקבוצה.'
             if args:txt+='\n📋 סיבה: '+html.escape(' '.join(args))
             await context.bot.send_message(cid,txt,parse_mode=ParseMode.HTML)
         except TelegramError:log.exception('Ban failed')
@@ -1897,7 +2132,9 @@ async def change_lock(bot, cid, lock, reason):
             key = ('holiday_unlock_text' if g['lock_reason'] == 'holiday' else
                    'shabbat_unlock_text' if g['lock_reason'] == 'shabbat' else
                    'unlock_text')
-        await send_formatted(bot, cid, d[key])
+        template_key='group_locked' if lock else 'group_unlocked'
+        group_message=d.get(key) or system_text(template_key)
+        await send_formatted(bot, cid, group_message)
         audit(cid, OWNER, 'lock' if lock else 'unlock', reason)
     except TelegramError:
         log.exception('Lock/unlock failed for %s', cid)

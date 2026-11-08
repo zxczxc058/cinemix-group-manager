@@ -437,20 +437,21 @@ async def ensure_group(bot,chat,notify=True):
 def menu(cid):
     g=get_group(cid)
     if not g:return None
-    return kb([('🔗 קישורים',f'page:links:{cid}'),('👋 ברוכים הבאים',f'page:welcome:{cid}')],
-              [('🛡️ אנטי ספאם',f'page:flood:{cid}'),('🚫 מילים אסורות',f'page:words:{cid}')],
-              [('🔒 נעילה',f'page:lock:{cid}'),('🕯️ שבת וחג',f'page:calendar:{cid}')],
-              [('👮 משתמשים',f'page:users:{cid}'),('✅ אימות',f'page:verify:{cid}')],
-              [('🤖 תגובות',f'page:replies:{cid}'),('📢 הודעות חוזרות',f'page:announcements:{cid}')],
-              [('🛡️ מורשים',f'page:allowlist:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
-              [('📦 גיבוי',f'page:backup:{cid}'),('🗑️ הודעות שירות',f'page:service:{cid}')],
-               [('🗑️ מחיקת פקודות',f'page:command_cleanup:{cid}')],
-              [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
-              [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('👑 פאנל בעלים',f'ownerall:x:{cid}')],
-              [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🧪 סימולטור',f'page:simulator:{cid}')],
-               [('📜 חוקי קבוצה',f'page:rules:{cid}'),('🔄 הודעות מועברות',f'page:forward:{cid}')],
-               [('📋 יומן פעולות',f'page:audit:{cid}'),('⭐ משתמשים מהימנים',f'page:trusted:{cid}')],
-               [('📖 מדריך',f'page:guide:{cid}'),('⬅️ קבוצות',f'list:all:0')])
+    return kb(
+        [('🔗 קישורים',f'page:links:{cid}'),('🗑️ הודעות שירות',f'page:service:{cid}')],
+        [('🗑️ מחיקת פקודות',f'page:command_cleanup:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
+        [('🛡️ אנטי ספאם',f'page:flood:{cid}'),('🚫 מילים אסורות',f'page:words:{cid}')],
+        [('👋 ברוכים הבאים',f'page:welcome:{cid}'),('✅ אימות',f'page:verify:{cid}')],
+        [('🔒 נעילה',f'page:lock:{cid}'),('🕯️ שבת וחג',f'page:calendar:{cid}')],
+        [('👮 משתמשים',f'page:users:{cid}'),('🛡️ מורשים',f'page:allowlist:{cid}')],
+        [('⭐ משתמשים מהימנים',f'page:trusted:{cid}'),('🕵️ מנהל סמוי',f'page:stealth:{cid}')],
+        [('🤖 תגובות',f'page:replies:{cid}'),('📢 הודעות חוזרות',f'page:announcements:{cid}')],
+        [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
+        [('📜 חוקי קבוצה',f'page:rules:{cid}'),('🔄 הודעות מועברות',f'page:forward:{cid}')],
+        [('📦 גיבוי',f'page:backup:{cid}'),('📋 יומן פעולות',f'page:audit:{cid}')],
+        [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('🧪 סימולטור',f'page:simulator:{cid}')],
+        [('👑 פאנל בעלים',f'ownerall:x:{cid}'),('📖 מדריך',f'page:guide:{cid}')],
+        [('⬅️ קבוצות',f'list:all:0')])
 
 
 async def list_groups(bot,uid,cid):
@@ -872,7 +873,7 @@ async def callbacks(update,context):
         panel_remember(uid,q.message.chat_id,q.message.message_id)
     try:
         action,value,cs=q.data.split(':',2)
-        cid=0 if action=='ownerexplain' else int(cs)
+        cid=0 if action in ('ownerexplain','ownertext') else int(cs)
     except Exception:
         await q.answer('שגיאה');return
     if action in ('ownerexplain','ownertext'):

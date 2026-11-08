@@ -32,7 +32,7 @@ PENDING = {}
 LAST_WELCOME = {}
 
 DEFAULT = {
- 'links': True, 'max_warn': 3, 'welcome': True, 'welcome_text': '👋 ברוך הבא {user}!\nשמחים שהצטרפת אלינו 💜',
+ 'links': True, 'max_warn': 3, 'delete_slash_commands': True, 'welcome': True, 'welcome_text': '👋 ברוך הבא {user}!\nשמחים שהצטרפת אלינו 💜',
  'welcome_buttons': [], 'welcome_media': None, 'welcome_seconds': 300,
  'service_delete': True, 'channel_posts_delete': False, 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
  'flood': False, 'flood_count': 5, 'flood_seconds': 10, 'flood_mute': 1800,
@@ -444,6 +444,7 @@ def menu(cid):
               [('🤖 תגובות',f'page:replies:{cid}'),('📢 הודעות חוזרות',f'page:announcements:{cid}')],
               [('🛡️ מורשים',f'page:allowlist:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
               [('📦 גיבוי',f'page:backup:{cid}'),('🗑️ הודעות שירות',f'page:service:{cid}')],
+               [('🗑️ מחיקת פקודות',f'page:command_cleanup:{cid}')],
               [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
               [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('👑 פאנל בעלים',f'ownerall:x:{cid}')],
               [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🧪 סימולטור',f'page:simulator:{cid}')],
@@ -470,7 +471,7 @@ async def list_groups(bot,uid,cid):
 def regular_start_text():
     with conn() as c:
         r=c.execute("SELECT val FROM meta WHERE key='regular_start_text'").fetchone()
-    return r['val'] if r else '🛡️ ברוכים הבאים לבוט CINEMIX לניהול קבוצות!'
+    return r['val'] if r else system_text('owner_welcome')
 
 
 # Owner-managed explanations. Missing overrides retain the original wording.
@@ -481,6 +482,8 @@ EXPLANATION_LABELS = {
     'verify':'✅ אימות', 'backup':'📦 גיבוי', 'channels':'📣 הודעות ערוץ',
     'allowlist':'🛡️ מורשים', 'stealth':'🕵️ מנהל סמוי',
     'forward':'🔄 הודעות מועברות', 'trusted':'⭐ משתמשים מהימנים',
+    'service':'🗑️ הודעות שירות', 'rules':'📜 חוקי קבוצה', 'audit':'📋 יומן פעולות',
+    'simulator':'🧪 סימולטור', 'guide':'📖 מדריך', 'command_cleanup':'🗑️ מחיקת פקודות',
 }
 EXPLANATION_SPECIAL = {
     'stealth': ('🕵️ מצב מנהל סמוי\n\nכדי לענות בשם הבוט: הגב להודעת המשתמש בקבוצה עם /reply, '
@@ -489,14 +492,68 @@ EXPLANATION_SPECIAL = {
     'trusted': '⭐ משתמשים מהימנים: /allow בתגובה להודעה, /unallow להסרה.',
 }
 
+# The original short texts are retained even if older detailed overrides exist.
+SHORT_DEFAULTS = {**HELP, **EXPLANATION_SPECIAL,
+    'service':'🗑️ מחיקת הודעות שירות בקבוצה.',
+    'rules':'📜 חוקי הקבוצה והאפשרות לפרסם אותם.',
+    'audit':'📋 צפייה בפעולות ניהול אחרונות.',
+    'simulator':'🧪 בדיקת תגובת הבוט להודעה.',
+    'guide':'📖 מדריך השימוש של CINEMIX.',
+    'command_cleanup':'🗑️ מחיקה אוטומטית של הודעות שמתחילות ב־/ בקבוצה.',
+}
+DETAIL_DEFAULTS = {**SHORT_DEFAULTS,
+    'command_cleanup':'🗑️ מחיקת פקודות: כשהאפשרות פעילה, הודעות שמתחילות ב־/ נמחקות מהקבוצה, גם ממשתמשים רגילים. פקודות מורשות ממשיכות להתבצע. נדרשת הרשאת מחיקת הודעות.',
+}
+SYSTEM_TEXTS = {
+    'owner_welcome':'🛡️ ברוכים הבאים לבוט CINEMIX לניהול קבוצות!',
+    'group_approved':'✅ הקבוצה אושרה להפעלת CINEMIX. מנהלי הקבוצה יכולים כעת לפתוח ניהול בפרטי.',
+    'group_rejected':'❌ הקבוצה לא אושרה לשימוש ב-CINEMIX. הבוט לא יבצע פעולות ניהול בקבוצה.',
+    'approval_sent':'✅ הבקשה נשלחה לבעלים לאישור.',
+    'approval_failed':'⚠️ הבקשה לא הועברה לבעלים. נסו שוב מאוחר יותר.',
+    'maintenance_notice':'🛠️ הבוט נמצא כעת בתחזוקה. אפשרויות הניהול זמנית אינן זמינות.',
+    'maintenance_end':'✅ תחזוקת CINEMIX הסתיימה. אפשרויות הניהול חזרו לפעילות.',
+    'import_invalid':'❌ קובץ גיבוי לא תקין',
+    'import_prompt':'השב לקובץ גיבוי JSON קטן מ־1MB עם /import',
+    'stealth_disabled':'🕵️ הפעל תחילה מצב מנהל סמוי בפאנל הקבוצה.',
+    'stealth_prompt':'💬 שלח כאן את התשובה שלך. היא תפורסם בקבוצה כתגובה להודעה המקורית, בשם הבוט. /cancel לביטול.',
+}
+SYSTEM_LABELS = {
+    'owner_welcome':'הודעת פתיחה כללית', 'group_approved':'אישור קבוצה',
+    'group_rejected':'דחיית קבוצה', 'approval_sent':'בקשת אישור נשלחה',
+    'approval_failed':'שגיאת בקשת אישור', 'maintenance_notice':'הודעת תחזוקה',
+    'maintenance_end':'סיום תחזוקה', 'import_invalid':'גיבוי לא תקין',
+    'import_prompt':'הנחיית ייבוא', 'stealth_disabled':'מנהל סמוי כבוי',
+    'stealth_prompt':'הנחיית תגובה סמויה',
+}
+
+def editable_text(kind,key):
+    defaults={'short':SHORT_DEFAULTS,'detail':DETAIL_DEFAULTS,'system':SYSTEM_TEXTS}[kind]
+    if kind=='detail':
+        # Compatibility with owner explanation edits from the preceding release.
+        old=meta_get('explanation_override:'+key,'')
+        return meta_get('owner_text:detail:'+key,'') or old or defaults.get(key,'')
+    return meta_get('owner_text:'+kind+':'+key,'') or defaults.get(key,'')
+
 def explanation_text(key):
-    return meta_get('explanation_override:'+key, '') or EXPLANATION_SPECIAL.get(key,HELP.get(key,''))
+    return editable_text('detail',key)
+
+def system_text(key):
+    return editable_text('system',key)
 
 def explanation_picker():
-    items=list(EXPLANATION_LABELS.items())
-    rows=[[ (EXPLANATION_LABELS[k],f'ownerexplain:view:{k}') ] for k in EXPLANATION_LABELS]
+    rows=[[ (EXPLANATION_LABELS[k],f'ownerexplain:select:{k}') ] for k in EXPLANATION_LABELS]
+    rows.append([('💬 תגובות והודעות מערכת','ownerexplain:systems:0')])
     rows.append([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
     return kb(*rows)
+
+def owner_text_actions(kind,key):
+    label=SYSTEM_LABELS.get(key,key) if kind=='system' else EXPLANATION_LABELS[key]
+    text=editable_text(kind,key)
+    heading={'short':'הסבר קצר','detail':'הסבר שימוש מפורט','system':'הודעת מערכת'}[kind]
+    return ('📝 '+label+' — '+heading+'\n\n'+text[:3300],
+        kb([('✏️ עריכת הטקסט',f'ownertext:edit:{kind},{key}')],
+           [('🔄 חזרה לברירת מחדל',f'ownertext:reset:{kind},{key}')],
+           [('⬅️ חזרה',f'ownerexplain:{"systems" if kind=="system" else "select"}:{"0" if kind=="system" else key}')]))
 
 def owner_menu():
     return kb(
@@ -729,11 +786,12 @@ FIELD_PAGES = {
     'holiday_lock_text':'calendar','holiday_unlock_text':'calendar',
     'verify':'verify','service_delete':'service','channel_posts_delete':'channels',
     'stealth':'stealth','forward_filter':'forward','rules_text':'rules',
+    'delete_slash_commands':'command_cleanup',
 }
 
 def settings_page_text(page):
     if page in EXPLANATION_LABELS:
-        return explanation_text(page)
+        return editable_text('short',page)
     return HELP.get(page,'⚙️ הגדרות הקבוצה — בחר פעולה:')
 
 async def refresh_settings(query,cid,page,notice=''):
@@ -759,7 +817,7 @@ def page_keyboard(cid,page):
     if page=='rules':rows.extend([[('✏️ עריכת חוקי קבוצה',f'edit:rules_text:{cid}')],[('📢 פרסום החוקים',f'rulespublish:x:{cid}')]])
     if page=='simulator':rows.append([('🧪 שלח הודעה לבדיקה',f'simstart:x:{cid}')])
     if page=='audit':rows.append([('📋 20 פעולות אחרונות',f'auditshow:x:{cid}')])
-    if page=='trusted':rows.append([('📖 הסבר שימוש',f'help:trusted:{cid}')])
+    if page=='command_cleanup':rows.append([('🟢 פעיל' if d['delete_slash_commands'] else '🔴 כבוי',f'toggle:delete_slash_commands:{cid}')])
     if page=='links':rows.append([(f'⚠️ אזהרות: {d["max_warn"]}',f'edit:max_warn:{cid}')])
     if page=='welcome':
         rows.extend([[('✏️ טקסט ברוכים הבאים',f'edit:welcome_text:{cid}')],
@@ -788,7 +846,7 @@ def page_keyboard(cid,page):
     if page=='backup':
         rows.append([('📤 ייצוא הגדרות',f'export:x:{cid}')])
         rows.append([('👑 שמור כברירת מחדל לכל קבוצה חדשה',f'defaults:x:{cid}')])
-    if page=='users':rows.append([('📖 פקודות משתמשים',f'help:users:{cid}')])
+    if page in EXPLANATION_LABELS:rows.append([('📖 הסבר שימוש',f'help:{page}:{cid}')])
     rows.append([('⬅️ חזרה להגדרות',f'open:x:{cid}')])
     return kb(*rows)
 
@@ -817,21 +875,36 @@ async def callbacks(update,context):
         cid=0 if action=='ownerexplain' else int(cs)
     except Exception:
         await q.answer('שגיאה');return
-    if action=='ownerexplain':
+    if action in ('ownerexplain','ownertext'):
         if uid!=OWNER or q.message.chat.type!='private':
             await q.answer('רק בעל הבוט',show_alert=True);return
-        key=cs
-        if key not in EXPLANATION_LABELS:
-            await q.answer('הסבר לא נמצא',show_alert=True);return
         await q.answer()
-        if value=='view':
-            await panel_from_query(q,'📝 '+EXPLANATION_LABELS[key]+'\n\n'+explanation_text(key)[:3400],
-                reply_markup=kb([('✏️ עריכת ההסבר',f'ownerexplain:edit:{key}')],
-                                [('⬅️ לכל ההסברים','owner:explanations:0')]))
-        elif value=='edit':
-            pending_set(uid,0,'owner_explanation:'+key)
-            await panel_from_query(q,'✏️ עריכת הסבר: '+EXPLANATION_LABELS[key]+'\n\nשלח עכשיו את הנוסח החדש בהודעה רגילה.\nהנוסח הקיים נשמר עד שתשלח שינוי. /cancel לביטול.',
-                reply_markup=kb([('⬅️ לכל ההסברים','owner:explanations:0')]))
+        if action=='ownerexplain':
+            if value=='systems':
+                await panel_from_query(q,'💬 הודעות ותגובות מערכת\n\nבחר הודעה לעריכה:',
+                    reply_markup=kb(*([[(label,f'ownertext:view:system,{key}')] for key,label in SYSTEM_LABELS.items()]+[[('⬅️ חזרה לכל הטקסטים','owner:explanations:0')]])))
+                return
+            key=cs
+            if key not in EXPLANATION_LABELS:return
+            if value=='select':
+                await panel_from_query(q,'📝 '+EXPLANATION_LABELS[key]+'\n\nבחר מה לערוך:',
+                    reply_markup=kb([('✏️ הסבר קצר',f'ownertext:view:short,{key}')],
+                                    [('📖 הסבר שימוש מפורט',f'ownertext:view:detail,{key}')],
+                                    [('⬅️ לכל ההסברים','owner:explanations:0')]))
+            return
+        try:kind,key=cs.split(',',1)
+        except ValueError:return
+        if kind not in ('short','detail','system') or key not in (SYSTEM_TEXTS if kind=='system' else EXPLANATION_LABELS):return
+        if value=='edit':
+            pending_set(uid,0,'owner_text:'+kind+':'+key)
+            await panel_from_query(q,'✏️ שלח טקסט חדש עבור '+(SYSTEM_LABELS[key] if kind=='system' else EXPLANATION_LABELS[key])+'.\n/cancel לביטול.',
+                reply_markup=kb([('⬅️ חזרה',f'ownertext:view:{kind},{key}')]))
+        else:
+            if value=='reset':
+                meta_set('owner_text:'+kind+':'+key,'')
+                if kind=='detail':meta_set('explanation_override:'+key,'')
+            text,markup=owner_text_actions(kind,key)
+            await panel_from_query(q,('✅ הוחזר לברירת המחדל!\n\n' if value=='reset' else '')+text,reply_markup=markup)
         return
     if action=='owner':
         if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
@@ -866,7 +939,7 @@ async def callbacks(update,context):
         if value=='toggle':
             active=meta_get('maintenance','0')=='1';new=not active
             meta_set('maintenance','1' if new else '0')
-            txt=meta_get('maintenance_text','🛠️ הבוט נמצא כעת בתחזוקה. אפשרויות הניהול זמנית אינן זמינות.') if new else '✅ תחזוקת CINEMIX הסתיימה. אפשרויות הניהול חזרו לפעילות.'
+            txt=meta_get('maintenance_text',system_text('maintenance_notice')) if new else system_text('maintenance_end')
             sent,failed=await owner_notify(context.bot,txt)
             await panel_from_query(q,f'{"🛠️ התחזוקה הופעלה" if new else "✅ התחזוקה הסתיימה"}\nהודעות שנשלחו: {sent}\nשליחות שנכשלו: {failed}',reply_markup=kb([('🟢 הפעל תחזוקה' if not new else '🔴 סיים תחזוקה','ownermaintenance:toggle:0')],[('✏️ ערוך הודעת תחזוקה','ownermaintenance:text:0')],[('⬅️ חזרה','owner:overview:0')]))
         return
@@ -883,7 +956,7 @@ async def callbacks(update,context):
         with conn() as c:
             c.execute('DELETE FROM group_requests WHERE chat=?',(cid,))
             c.commit()
-        decision='✅ הקבוצה אושרה להפעלת CINEMIX. מנהלי הקבוצה יכולים כעת לפתוח ניהול בפרטי.' if value=='1' else '❌ הקבוצה לא אושרה לשימוש ב-CINEMIX. הבוט לא יבצע פעולות ניהול בקבוצה.'
+        decision=system_text('group_approved') if value=='1' else system_text('group_rejected')
         try:await context.bot.send_message(cid,decision)
         except TelegramError:log.warning('Cannot announce approval in %s',cid)
         with conn() as c:inv=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
@@ -1093,7 +1166,7 @@ async def callbacks(update,context):
         await q.answer();await panel_from_query(q,explanation_text(value),reply_markup=kb([('⬅️ חזרה',f'page:{value}:{cid}')]))
         return
     if action=='toggle':
-        if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth'):await q.answer('לא נתמך');return
+        if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth','delete_slash_commands'):await q.answer('לא נתמך');return
         new_state=not cfg(cid)[value]
         set_cfg(cid,value,new_state);await q.answer('נשמר')
         await refresh_settings(q,cid,FIELD_PAGES[value],'✅ ההגדרה עודכנה.')
@@ -1217,6 +1290,19 @@ async def input_private(update,context):
             d=cfg(cid);d['announcements'][index]['active_hours']=hours;save_cfg(cid,d);clear_pending(uid)
             await private_settings_result(update.message,cid,'announcements','✅ שעות הפעילות נשמרו')
         except (ValueError,IndexError,KeyError):await panel_from_input(update,context,'❌ שלח 09:00-23:00 או מחק')
+        return
+    if key.startswith('owner_text:'):
+        if uid!=OWNER:return
+        _,kind,text_key=key.split(':',2)
+        if kind not in ('short','detail','system') or text_key not in (SYSTEM_TEXTS if kind=='system' else EXPLANATION_LABELS):
+            clear_pending(uid);return
+        value=(update.message.text or update.message.caption or '').strip()
+        if not value or len(value)>3500:
+            await panel_from_input(update,context,'❌ שלח טקסט באורך 1–3500 תווים.');return
+        meta_set('owner_text:'+kind+':'+text_key,value)
+        clear_pending(uid)
+        text,markup=owner_text_actions(kind,text_key)
+        await panel_from_input(update,context,'✅ הטקסט נשמר!\n\n'+text,reply_markup=markup)
         return
     if key.startswith('owner_explanation:'):
         if uid!=OWNER:return
@@ -1593,13 +1679,13 @@ async def commands(update,context):
     args=msg.text.split()[1:]
     if cmd=='reply':
         if not cfg(cid).get('stealth'):
-            try:await context.bot.send_message(u.id,'🕵️ הפעל תחילה מצב מנהל סמוי בפאנל הקבוצה.')
+            try:await context.bot.send_message(u.id,system_text('stealth_disabled'))
             except TelegramError:pass
             return
         if not msg.reply_to_message:return
         draft_set(u.id,cid,'stealth_reply',{'mid':msg.reply_to_message.message_id})
         pending_set(u.id,cid,'stealth_reply')
-        try:await context.bot.send_message(u.id,'💬 שלח כאן את התשובה שלך. היא תפורסם בקבוצה כתגובה להודעה המקורית, בשם הבוט. /cancel לביטול.')
+        try:await context.bot.send_message(u.id,system_text('stealth_prompt'))
         except TelegramError:pass
         return
     audit(cid,u.id,'command',cmd)
@@ -1615,7 +1701,7 @@ async def commands(update,context):
     if cmd=='import':
         doc=msg.reply_to_message.document if msg.reply_to_message else None
         if not doc or doc.file_size>1_000_000:
-            await context.bot.send_message(cid,'השב לקובץ גיבוי JSON קטן מ־1MB עם /import');return
+            await context.bot.send_message(cid,system_text('import_prompt'));return
         try:
             f=await context.bot.get_file(doc.file_id);raw=await f.download_as_bytearray()
             data=json.loads(raw.decode('utf-8'))
@@ -1623,7 +1709,7 @@ async def commands(update,context):
             clean={**copy.deepcopy(DEFAULT),**{k:v for k,v in data['settings'].items() if k in DEFAULT}}
             PENDING[('import',u.id,cid)]=clean
             await context.bot.send_message(cid,'⚠️ ייבוא זה יחליף את כל הגדרות הקבוצה. לא יועברו אישורי קבוצות.',reply_markup=kb([('✅ אישור ייבוא',f'import:x:{cid}')]))
-        except Exception:await context.bot.send_message(cid,'❌ קובץ גיבוי לא תקין')
+        except Exception:await context.bot.send_message(cid,system_text('import_invalid'))
         return
     if cmd in ('allow','unallow') and target:
         d=cfg(cid);s=set(d['allowlist']);s.add(target.id) if cmd=='allow' else s.discard(target.id)
@@ -1827,6 +1913,17 @@ async def error_handler(update,context):
     log.error('Unhandled bot error: %s',context.error,exc_info=context.error)
 
 
+async def cleanup_slash_commands(update,context):
+    """Remove slash-prefixed messages in approved groups; command handlers run first."""
+    msg=update.effective_message
+    if not msg or not msg.text or not msg.text.startswith('/'):
+        return
+    g=get_group(msg.chat_id)
+    if not g or not g['approved'] or not g.get('active',1):return
+    if cfg(msg.chat_id).get('delete_slash_commands',True):
+        await safe_delete(context.bot,msg.chat_id,msg.message_id)
+
+
 def main():
     if not TOKEN:raise RuntimeError('Set BOT_TOKEN in Render environment variables')
     conn().close()
@@ -1849,6 +1946,7 @@ def main():
     group_commands=['reply','warn','warnings','mute','unmute','ban','unban','clean','lock','unlock','allow','unallow','export','import']
     for command in group_commands:app.add_handler(CommandHandler(command,commands,filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,moderate))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.Regex(r'^/'),cleanup_slash_commands),group=1)
     app.add_error_handler(error_handler)
     if app.job_queue:app.job_queue.run_repeating(periodic,interval=20,first=5,job_kwargs={'max_instances':1,'coalesce':True})
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -570,6 +570,7 @@ async def owner_dashboard(bot,recipient,section):
 async def owner_panel(update,context):
     if update.effective_chat.type!='private' or update.effective_user.id!=OWNER:
         return
+    await panel_new(context.bot,update.effective_user.id)
     await owner_dashboard(context.bot,update.effective_chat.id,'overview')
 
 
@@ -615,10 +616,13 @@ async def manage(update,context):
             await context.bot.send_message(chat.id,'✅ הבקשה נשלחה לבעלים לאישור.' if result!='failed' else '⚠️ הבקשה לא הועברה לבעלים. נסו שוב מאוחר יותר.')
             return
         await safe_delete(context.bot,chat.id,update.message.message_id)
-        try:await context.bot.send_message(uid,'⚙️ ניהול קבוצות:',reply_markup=kb([('👥 בחר קבוצה','list:all:0')]))
+        try:
+            await panel_new(context.bot,uid)
+            await panel_update(context.bot,uid,'⚙️ ניהול קבוצות:',reply_markup=kb([('👥 בחר קבוצה','list:all:0')]))
         except TelegramError:await context.bot.send_message(chat.id,'פתח תחילה את הבוט בפרטי ולחץ Start.')
     else:
         if uid==OWNER or any(g['approved'] and await authorized(context.bot,uid,g['id']) for g in all_groups()):
+            await panel_new(context.bot,uid)
             await list_groups(context.bot,uid,chat.id)
         else:
             await panel_update(context.bot,OWNER,regular_start_text())
@@ -626,6 +630,7 @@ async def manage(update,context):
 
 async def groups_cmd(update,context):
     if update.effective_chat.type=='private' and update.effective_user.id==OWNER:
+        await panel_new(context.bot,OWNER)
         await list_groups(context.bot,OWNER,update.effective_chat.id)
 
 
@@ -660,6 +665,13 @@ def panel_remember(uid,chat,mid):
 def panel_location(uid):
     with conn() as c:r=c.execute('SELECT chat,mid FROM admin_panels WHERE uid=?',(uid,)).fetchone()
     return (r['chat'],r['mid']) if r else None
+
+
+async def panel_new(bot,uid):
+    """A fresh command starts a new panel below the command; button presses edit it."""
+    with conn() as c:
+        c.execute('DELETE FROM admin_panels WHERE uid=?',(uid,))
+        c.commit()
 
 
 async def panel_update(bot,uid,text,reply_markup=None):
@@ -800,8 +812,11 @@ async def callbacks(update,context):
     q=update.callback_query;uid=q.from_user.id
     if q.message and q.message.chat.type=='private' and q.data.split(':',1)[0] not in ('verify','warncancel','unmute','approval'):
         panel_remember(uid,q.message.chat_id,q.message.message_id)
-    try:action,value,cs=q.data.split(':',2);cid=int(cs)
-    except Exception:await q.answer('שגיאה');return
+    try:
+        action,value,cs=q.data.split(':',2)
+        cid=0 if action=='ownerexplain' else int(cs)
+    except Exception:
+        await q.answer('שגיאה');return
     if action=='ownerexplain':
         if uid!=OWNER or q.message.chat.type!='private':
             await q.answer('רק בעל הבוט',show_alert=True);return

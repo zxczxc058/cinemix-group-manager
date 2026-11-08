@@ -479,13 +479,12 @@ def menu(cid):
         [('👋 ברוכים הבאים',f'page:welcome:{cid}'),('✅ אימות',f'page:verify:{cid}')],
         [('🔒 נעילה',f'page:lock:{cid}'),('🕯️ שבת וחג',f'page:calendar:{cid}')],
         [('👮 משתמשים',f'page:users:{cid}'),('🛡️ מורשים',f'page:allowlist:{cid}')],
-        [('⭐ משתמשים מהימנים',f'page:trusted:{cid}'),('🕵️ מנהל סמוי',f'page:stealth:{cid}')],
-        [('🤖 תגובות',f'page:replies:{cid}'),('📢 הודעות חוזרות',f'page:announcements:{cid}')],
-        [('📣 פרסום עכשיו',f'wiz:broadcast:{cid}'),('📊 סטטיסטיקות',f'stats:x:{cid}')],
-        [('📜 חוקי קבוצה',f'page:rules:{cid}'),('🔄 הודעות מועברות',f'page:forward:{cid}')],
-        [('📦 גיבוי',f'page:backup:{cid}'),('📋 יומן פעולות',f'page:audit:{cid}')],
-        [('🩺 בדיקת הרשאות',f'health:x:{cid}'),('🧪 סימולטור',f'page:simulator:{cid}')],
-        [('👑 פאנל בעלים',f'ownerall:x:{cid}'),('📖 מדריך',f'page:guide:{cid}')],
+        [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🤖 תגובות',f'page:replies:{cid}')],
+        [('📢 הודעות חוזרות',f'page:announcements:{cid}'),('📣 פרסום עכשיו',f'wiz:broadcast:{cid}')],
+        [('📊 סטטיסטיקות',f'stats:x:{cid}'),('📜 חוקי קבוצה',f'page:rules:{cid}')],
+        [('🔄 הודעות מועברות',f'page:forward:{cid}'),('📦 גיבוי',f'page:backup:{cid}')],
+        [('📋 יומן פעולות',f'page:audit:{cid}'),('🩺 בדיקת הרשאות',f'health:x:{cid}')],
+        [('🧪 סימולטור',f'page:simulator:{cid}'),('👑 פאנל בעלים',f'ownerall:x:{cid}')],
         [('⬅️ קבוצות',f'list:all:0')])
 
 
@@ -669,8 +668,7 @@ def owner_menu():
         [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
         [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
         [('👥 הרשאות ניהול','managergrants:list:0'),('💬 ניהול הודעות הבוט','botmessages:categories:0')],
-         [('📝 ניהול הסברים והודעות מערכת','owner:explanations:0')],
-         [('📖 מדריך','guide:all:0')])
+         [('📝 ניהול הסברים והודעות מערכת','owner:explanations:0')])
 
 
 async def owner_dashboard(bot,recipient,section):

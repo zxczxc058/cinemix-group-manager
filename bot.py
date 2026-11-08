@@ -535,8 +535,17 @@ def editable_text(kind,key):
         return meta_get('owner_text:detail:'+key,'') or old or defaults.get(key,'')
     return meta_get('owner_text:'+kind+':'+key,'') or defaults.get(key,'')
 
+def explanation_enabled(kind,key):
+    # Absence of a setting means enabled, preserving existing installations.
+    return meta_get('owner_text_enabled:'+kind+':'+key,'1') != '0'
+
+def owner_explanation_menu(key):
+    return kb([('✏️ הסבר קצר',f'ownertext:view:short,{key}')],
+              [('📖 הסבר שימוש מפורט',f'ownertext:view:detail,{key}')],
+              [('⬅️ לכל ההסברים','owner:explanations:0')])
+
 def explanation_text(key):
-    return editable_text('detail',key)
+    return editable_text('detail',key) if explanation_enabled('detail',key) else ''
 
 def system_text(key):
     return editable_text('system',key)
@@ -551,10 +560,14 @@ def owner_text_actions(kind,key):
     label=SYSTEM_LABELS.get(key,key) if kind=='system' else EXPLANATION_LABELS[key]
     text=editable_text(kind,key)
     heading={'short':'הסבר קצר','detail':'הסבר שימוש מפורט','system':'הודעת מערכת'}[kind]
-    return ('📝 '+label+' — '+heading+'\n\n'+text[:3300],
-        kb([('✏️ עריכת הטקסט',f'ownertext:edit:{kind},{key}')],
-           [('🔄 חזרה לברירת מחדל',f'ownertext:reset:{kind},{key}')],
-           [('⬅️ חזרה',f'ownerexplain:{"systems" if kind=="system" else "select"}:{"0" if kind=="system" else key}')]))
+    rows=[[('✏️ עריכת הטקסט',f'ownertext:edit:{kind},{key}')]]
+    if kind in ('short','detail'):
+        enabled=explanation_enabled(kind,key)
+        rows.append([(('🔴 השבתת ההסבר' if enabled else '🟢 הפעלת ההסבר'),f'ownertext:toggle:{kind},{key}')])
+    rows.append([('🔄 חזרה לברירת מחדל',f'ownertext:reset:{kind},{key}')])
+    rows.append([('⬅️ חזרה',f'ownerexplain:{"systems" if kind=="system" else "select"}:{"0" if kind=="system" else key}')])
+    status=('\n\nמצב: '+('🟢 פעיל' if explanation_enabled(kind,key) else '🔴 מושבת')) if kind in ('short','detail') else ''
+    return ('📝 '+label+' — '+heading+status+'\n\n'+text[:3300],kb(*rows))
 
 def owner_menu():
     return kb(
@@ -746,6 +759,18 @@ async def panel_update(bot,uid,text,reply_markup=None):
 
 
 async def panel_from_query(q,text,reply_markup=None,**kwargs):
+    # Never leave a private menu screen stranded without a back button.
+    if reply_markup is None and q.message and q.message.chat.type=='private':
+        parts=(q.data or '').split(':',2)
+        action=parts[0] if parts else ''
+        try: cid=int(parts[2]) if len(parts)>2 else 0
+        except (ValueError,TypeError): cid=0
+        if action.startswith('owner') or action=='guide' and cid==0:
+            reply_markup=kb([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
+        elif cid:
+            reply_markup=kb([('⬅️ חזרה להגדרות',f'open:x:{cid}')])
+        else:
+            reply_markup=kb([('⬅️ חזרה לקבוצות','list:mine:0')])
     await panel_update(q.get_bot(),q.from_user.id,text,reply_markup)
 
 
@@ -847,7 +872,7 @@ def page_keyboard(cid,page):
     if page=='backup':
         rows.append([('📤 ייצוא הגדרות',f'export:x:{cid}')])
         rows.append([('👑 שמור כברירת מחדל לכל קבוצה חדשה',f'defaults:x:{cid}')])
-    if page in EXPLANATION_LABELS:rows.append([('📖 הסבר שימוש',f'help:{page}:{cid}')])
+    if page in EXPLANATION_LABELS and explanation_enabled('detail',page):rows.append([('📖 הסבר שימוש',f'help:{page}:{cid}')])
     rows.append([('⬅️ חזרה להגדרות',f'open:x:{cid}')])
     return kb(*rows)
 
@@ -901,11 +926,13 @@ async def callbacks(update,context):
             await panel_from_query(q,'✏️ שלח טקסט חדש עבור '+(SYSTEM_LABELS[key] if kind=='system' else EXPLANATION_LABELS[key])+'.\n/cancel לביטול.',
                 reply_markup=kb([('⬅️ חזרה',f'ownertext:view:{kind},{key}')]))
         else:
+            if value=='toggle' and kind in ('short','detail'):
+                meta_set('owner_text_enabled:'+kind+':'+key,'0' if explanation_enabled(kind,key) else '1')
             if value=='reset':
                 meta_set('owner_text:'+kind+':'+key,'')
                 if kind=='detail':meta_set('explanation_override:'+key,'')
             text,markup=owner_text_actions(kind,key)
-            await panel_from_query(q,('✅ הוחזר לברירת המחדל!\n\n' if value=='reset' else '')+text,reply_markup=markup)
+            await panel_from_query(q,('✅ הוחזר לברירת המחדל!\n\n' if value=='reset' else '✅ מצב ההסבר עודכן.\n\n' if value=='toggle' else '')+text,reply_markup=markup)
         return
     if action=='owner':
         if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return

@@ -102,6 +102,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS member_counts (chat INTEGER PRIMARY KEY, last_count INTEGER DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS admin_panels (uid INTEGER PRIMARY KEY, chat INTEGER, mid INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS manager_grants (chat INTEGER NOT NULL, uid INTEGER NOT NULL, granted_at INTEGER NOT NULL, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS manager_revocations (chat INTEGER NOT NULL, uid INTEGER NOT NULL, revoked_at INTEGER NOT NULL, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS text_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, text_key TEXT NOT NULL, old_value TEXT NOT NULL, changed_at INTEGER NOT NULL)')
     c.commit()
     return c
@@ -327,6 +328,11 @@ async def authorized(bot,uid,cid):
     with conn() as c:
         granted=c.execute('SELECT 1 FROM manager_grants WHERE chat=? AND uid=?',(cid,uid)).fetchone()
     if granted:return True
+    # Owner revocations override Telegram-admin status for access to THIS bot only.
+    # Never revoke the bot owner or change the user's Telegram group role.
+    with conn() as c:
+        revoked=c.execute('SELECT 1 FROM manager_revocations WHERE chat=? AND uid=?',(cid,uid)).fetchone()
+    if revoked:return False
     try:
         m=await bot.get_chat_member(cid,uid)
         return m.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
@@ -1080,9 +1086,21 @@ async def callbacks(update,context):
             if not g:return
             with conn() as c:
                 users=c.execute('SELECT uid FROM manager_grants WHERE chat=? ORDER BY granted_at DESC',(cid,)).fetchall()
-            rows=[[('❌ הסר '+str(r['uid']),f'managergrants:remove_{r["uid"]}:{cid}')] for r in users[:50]]
+                inviter=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
+                revoked={r['uid'] for r in c.execute('SELECT uid FROM manager_revocations WHERE chat=?',(cid,)).fetchall()}
+            ids={r['uid'] for r in users}
+            requester=inviter['inviter'] if inviter else None
+            rows=[[('❌ הסר '+str(r['uid']),f'managergrants:remove_{r["uid"]}:{cid}')] for r in users[:50] if r['uid']!=OWNER]
+            if requester and requester!=OWNER and requester not in ids and requester not in revoked:
+                rows.insert(0,[('❌ הסר מבקש אישור '+str(requester),f'managergrants:remove_{requester}:{cid}')])
+            for target in sorted(revoked):
+                if target!=OWNER:
+                    rows.append([('↩️ החזר הרשאה '+str(target),f'managergrants:restore_{target}:{cid}')])
             rows.extend([[('➕ הוסף לפי מזהה משתמש',f'managergrants:add:{cid}')],[('👮 מנהלי טלגרם בקבוצה',f'managergrants:telegram:{cid}')],[('⬅️ לכל הקבוצות','managergrants:list:0')]])
-            await panel_from_query(q,'👥 מורשים לניהול דרך הבוט - '+g['title']+'\n'+('\n'.join(str(r['uid']) for r in users) if users else 'אין הרשאות נוספות.'),reply_markup=kb(*rows))
+            display=[str(r['uid']) for r in users if r['uid'] not in revoked]
+            if requester and requester not in ids and requester not in revoked:
+                display.append('מבקש אישור: '+str(requester))
+            await panel_from_query(q,'👥 מורשים לניהול דרך הבוט - '+g['title']+'\n'+('\n'.join(display) if display else 'אין הרשאות נוספות.'),reply_markup=kb(*rows))
             return
         if value=='telegram':
             try:
@@ -1099,9 +1117,19 @@ async def callbacks(update,context):
             return
         if value.startswith('remove_'):
             target=int(value.partition('_')[2])
+            if target==OWNER:
+                await q.answer('לא ניתן להסיר את בעל הבוט',show_alert=True);return
             with conn() as c:
-                c.execute('DELETE FROM manager_grants WHERE chat=? AND uid=?',(cid,target));c.commit()
-            await panel_from_query(q,'✅ ההרשאה הוסרה.',reply_markup=kb([('⬅️ לרשימה',f'managergrants:group:{cid}')]))
+                c.execute('DELETE FROM manager_grants WHERE chat=? AND uid=?',(cid,target))
+                c.execute('INSERT OR REPLACE INTO manager_revocations(chat,uid,revoked_at) VALUES (?,?,?)',(cid,target,int(time.time())))
+                c.commit()
+            await panel_from_query(q,'✅ הרשאת הניהול בבוט הוסרה. תפקיד המשתמש בטלגרם לא השתנה.',reply_markup=kb([('⬅️ לרשימה',f'managergrants:group:{cid}')]))
+            return
+        if value.startswith('restore_'):
+            target=int(value.partition('_')[2])
+            with conn() as c:
+                c.execute('DELETE FROM manager_revocations WHERE chat=? AND uid=?',(cid,target));c.commit()
+            await panel_from_query(q,'✅ חסימת הניהול בבוט בוטלה. ההרשאה תלויה בתפקיד בטלגרם או בהרשאה פנימית.',reply_markup=kb([('⬅️ לרשימה',f'managergrants:group:{cid}')]))
             return
     # An owner explanation editor must not keep an unrelated pending input.
     if action in ('ownerexplain','ownertext') and not (action=='ownertext' and value=='edit'):
@@ -1551,6 +1579,7 @@ async def input_private(update,context):
             await panel_from_input(update,context,'❌ לא ניתן לאמת שהמשתמש חבר בקבוצה. לא נוספה הרשאה.');return
         with conn() as c:
             c.execute('INSERT OR REPLACE INTO manager_grants(chat,uid,granted_at) VALUES (?,?,?)',(cid,int(raw),int(time.time())))
+            c.execute('DELETE FROM manager_revocations WHERE chat=? AND uid=?',(cid,int(raw)))
             c.commit()
         clear_pending(uid)
         await panel_from_input(update,context,'✅ נוספה הרשאת ניהול דרך הבוט למזהה '+raw+'\nהמשתמש צריך לפתוח את הבוט בפרטי.',reply_markup=kb([('⬅️ לרשימת המורשים',f'managergrants:group:{cid}')]))

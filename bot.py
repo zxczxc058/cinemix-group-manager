@@ -285,6 +285,20 @@ def message_formatted(msg):
     return ''
 
 
+
+def formatted_payload_after_separator(msg,separator_count,fallback):
+    """Keep Telegram formatting in structured text fields when delimiters are unformatted."""
+    raw=msg.text or msg.caption or ''
+    if raw.count('|')<separator_count:return fallback
+    formatted=message_formatted(msg)
+    if not formatted.startswith('HTML:'):return fallback
+    body=formatted[5:]
+    # Most inputs format only the message body, leaving delimiters outside entities.
+    if body.count('|')>=separator_count:
+        candidate=body.split('|',separator_count)[-1].strip()
+        if candidate:return 'HTML:'+candidate
+    return fallback
+
 def buttons(rows):
     kb=[]
     for item in rows or []:
@@ -985,7 +999,7 @@ async def callbacks(update,context):
             c.execute('DELETE FROM group_requests WHERE chat=?',(cid,))
             c.commit()
         decision=system_text('group_approved') if value=='1' else system_text('group_rejected')
-        try:await context.bot.send_message(cid,decision)
+        try:await send_formatted(context.bot,cid,decision)
         except TelegramError:log.warning('Cannot announce approval in %s',cid)
         with conn() as c:inv=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
         if inv:
@@ -1324,7 +1338,7 @@ async def input_private(update,context):
         _,kind,text_key=key.split(':',2)
         if kind not in ('short','detail','system') or text_key not in (SYSTEM_TEXTS if kind=='system' else EXPLANATION_LABELS):
             clear_pending(uid);return
-        value=(update.message.text or update.message.caption or '').strip()
+        value=message_formatted(update.message).strip()
         if not value or len(value)>3500:
             await panel_from_input(update,context,'❌ שלח טקסט באורך 1–3500 תווים.');return
         meta_set('owner_text:'+kind+':'+text_key,value)
@@ -1337,7 +1351,7 @@ async def input_private(update,context):
         explain_key=key.split(':',1)[1]
         if explain_key not in EXPLANATION_LABELS:
             clear_pending(uid);return
-        value=(update.message.text or update.message.caption or '').strip()
+        value=message_formatted(update.message).strip()
         if not value or len(value)>3500:
             await panel_from_input(update,context,'❌ שלח הסבר באורך 1–3500 תווים.');return
         meta_set('explanation_override:'+explain_key,value)
@@ -1348,7 +1362,7 @@ async def input_private(update,context):
         return
     if key=='maintenance_text':
         if uid!=OWNER:return
-        value=(update.message.text or '').strip()
+        value=message_formatted(update.message).strip()
         if not value or len(value)>3500:await panel_from_input(update,context,'שלח טקסט עד 3500 תווים.');return
         meta_set('maintenance_text',value);clear_pending(uid)
         await panel_from_input(update,context,'✅ הודעת התחזוקה נשמרה.');return
@@ -1372,7 +1386,7 @@ async def input_private(update,context):
         return
     if key=='owner_start_text':
         if uid!=OWNER:return
-        value=(update.message.text or update.message.caption or '').strip()
+        value=message_formatted(update.message).strip()
         if not value or len(value)>3500:
             await panel_from_input(update,context,'❌ שלח טקסט באורך 1–3500 תווים. ההגדרה עדיין ממתינה.')
             return
@@ -1428,21 +1442,21 @@ async def input_private(update,context):
             if kind=='replies':
                 trigger,mode,response=[x.strip() for x in raw.split('|',2)]
                 assert trigger and mode in ('exact','contains') and response
-                d[kind][index].update(trigger=trigger,mode=mode,text=response)
+                d[kind][index].update(trigger=trigger,mode=mode,text=formatted_payload_after_separator(update.message,2,response))
             elif kind=='announcements':
                 minutes,response=raw.split('|',1);minutes=int(minutes);assert minutes>0
-                d[kind][index].update(minutes=minutes,text=response.strip(),last=int(time.time()))
+                d[kind][index].update(minutes=minutes,text=formatted_payload_after_separator(update.message,1,response.strip()),last=int(time.time()))
             save_cfg(cid,d);clear_pending(uid);await private_settings_result(update.message,cid,'replies' if kind=='replies' else 'announcements','✅ נערך בהצלחה');return
         elif key=='add_reply':
             trigger,mode,response=[x.strip() for x in raw.split('|',2)]
             assert mode in ('exact','contains') and trigger and response
-            d['replies'].append({'trigger':trigger,'mode':mode,'text':response,'buttons':[]});save_cfg(cid,d)
+            d['replies'].append({'trigger':trigger,'mode':mode,'text':formatted_payload_after_separator(update.message,2,response),'buttons':[]});save_cfg(cid,d)
             clear_pending(uid);await private_settings_result(update.message,cid,'replies','✅ התגובה נוספה');return
         elif key=='add_announcement':
             minutes,response=raw.split('|',1);minutes=int(minutes.strip());assert minutes>=1
-            d['announcements'].append({'minutes':minutes,'text':response.strip(),'last':int(time.time())});save_cfg(cid,d)
+            d['announcements'].append({'minutes':minutes,'text':formatted_payload_after_separator(update.message,1,response.strip()),'last':int(time.time())});save_cfg(cid,d)
             clear_pending(uid);await private_settings_result(update.message,cid,'announcements','✅ ההודעה החוזרת נוספה');return
-        else:val='HTML:'+update.message.text_html if update.message.text and update.message.entities else raw
+        else:val=message_formatted(update.message)
         set_cfg(cid,key,val)
         clear_pending(uid)
         await private_settings_result(update.message,cid,FIELD_PAGES.get(key,'lock'))
@@ -1707,13 +1721,13 @@ async def commands(update,context):
     args=msg.text.split()[1:]
     if cmd=='reply':
         if not cfg(cid).get('stealth'):
-            try:await context.bot.send_message(u.id,system_text('stealth_disabled'))
+            try:await send_formatted(context.bot,u.id,system_text('stealth_disabled'))
             except TelegramError:pass
             return
         if not msg.reply_to_message:return
         draft_set(u.id,cid,'stealth_reply',{'mid':msg.reply_to_message.message_id})
         pending_set(u.id,cid,'stealth_reply')
-        try:await context.bot.send_message(u.id,system_text('stealth_prompt'))
+        try:await send_formatted(context.bot,u.id,system_text('stealth_prompt'))
         except TelegramError:pass
         return
     audit(cid,u.id,'command',cmd)
@@ -1729,7 +1743,7 @@ async def commands(update,context):
     if cmd=='import':
         doc=msg.reply_to_message.document if msg.reply_to_message else None
         if not doc or doc.file_size>1_000_000:
-            await context.bot.send_message(cid,system_text('import_prompt'));return
+            await send_formatted(context.bot,cid,system_text('import_prompt'));return
         try:
             f=await context.bot.get_file(doc.file_id);raw=await f.download_as_bytearray()
             data=json.loads(raw.decode('utf-8'))
@@ -1737,7 +1751,7 @@ async def commands(update,context):
             clean={**copy.deepcopy(DEFAULT),**{k:v for k,v in data['settings'].items() if k in DEFAULT}}
             PENDING[('import',u.id,cid)]=clean
             await context.bot.send_message(cid,'⚠️ ייבוא זה יחליף את כל הגדרות הקבוצה. לא יועברו אישורי קבוצות.',reply_markup=kb([('✅ אישור ייבוא',f'import:x:{cid}')]))
-        except Exception:await context.bot.send_message(cid,system_text('import_invalid'))
+        except Exception:await send_formatted(context.bot,cid,system_text('import_invalid'))
         return
     if cmd in ('allow','unallow') and target:
         d=cfg(cid);s=set(d['allowlist']);s.add(target.id) if cmd=='allow' else s.discard(target.id)
@@ -1798,15 +1812,18 @@ async def change_lock(bot,cid,lock,reason):
         if lock:
             chat=await bot.get_chat(cid)
             original=permissions_to_dict(chat.permissions)
-            await bot.set_chat_permissions(cid,ChatPermissions(can_send_messages=False,can_send_audios=False,can_send_documents=False,can_send_photos=False,can_send_videos=False,can_send_video_notes=False,can_send_voice_notes=False,can_send_polls=False,can_send_other_messages=False,can_add_web_page_previews=False))
+            if not original:
+                log.error('Cannot lock %s without a complete permissions snapshot',cid)
+                return
             set_group(cid,locked=1,permissions=json.dumps(original),lock_reason=reason)
+            await bot.set_chat_permissions(cid,ChatPermissions(can_send_messages=False,can_send_audios=False,can_send_documents=False,can_send_photos=False,can_send_videos=False,can_send_video_notes=False,can_send_voice_notes=False,can_send_polls=False,can_send_other_messages=False,can_add_web_page_previews=False),use_independent_chat_permissions=True)
             key='holiday_lock_text' if reason=='holiday' else 'shabbat_lock_text' if reason=='shabbat' else 'lock_text'
         else:
             original=json.loads(g['permissions'] or '{}')
             if not original:
                 log.error('Refusing to unlock %s without saved permissions',cid)
                 return
-            await bot.set_chat_permissions(cid,ChatPermissions(**original))
+            await bot.set_chat_permissions(cid,ChatPermissions(**original),use_independent_chat_permissions=True)
             set_group(cid,locked=0,permissions=None,lock_reason=None)
             key='holiday_unlock_text' if g['lock_reason']=='holiday' else 'shabbat_unlock_text' if g['lock_reason']=='shabbat' else 'unlock_text'
         await send_formatted(bot,cid,d[key])

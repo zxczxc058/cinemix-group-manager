@@ -1791,59 +1791,103 @@ async def export_file(bot,recipient,cid):
     await bot.send_document(recipient,bio,caption='📦 גיבוי הגדרות CINEMIX. אין בו טוקן או הרשאות בעלים.')
 
 
+# Permission snapshots must preserve Telegram's nullable fields.  In particular,
+# None is NOT the same as an explicit True.  Never infer extra media rights.
+_PERMISSION_FIELDS = (
+    'can_send_messages', 'can_send_audios', 'can_send_documents',
+    'can_send_photos', 'can_send_videos', 'can_send_video_notes',
+    'can_send_voice_notes', 'can_send_polls', 'can_send_other_messages',
+    'can_add_web_page_previews', 'can_change_info', 'can_invite_users',
+    'can_pin_messages', 'can_manage_topics',
+)
+_MEDIA_FIELDS = (
+    'can_send_audios', 'can_send_documents', 'can_send_photos',
+    'can_send_videos', 'can_send_video_notes', 'can_send_voice_notes',
+    'can_send_polls', 'can_send_other_messages', 'can_add_web_page_previews',
+)
+
+
 def permissions_to_dict(p):
-    if not p:return {}
-    fields=('can_send_messages','can_send_audios','can_send_documents','can_send_photos','can_send_videos','can_send_video_notes','can_send_voice_notes','can_send_polls','can_send_other_messages','can_add_web_page_previews','can_change_info','can_invite_users','can_pin_messages','can_manage_topics')
-    return {k:bool(getattr(p,k,None)) for k in fields}
+    if p is None:
+        return {}
+    return {name: getattr(p, name, None) for name in _PERMISSION_FIELDS}
 
 
-async def member_permissions(bot,cid):
-    chat=await bot.get_chat(cid)
+def _explicit_permissions(saved):
+    # Telegram's API treats omitted fields as disabled when setting permissions.
+    # Explicit False avoids any implied media permissions on restoration.
+    return {name: saved.get(name) is True for name in _PERMISSION_FIELDS}
+
+
+def _permission_differences(expected, observed):
+    return {name: {'expected': value, 'actual': observed.get(name)}
+            for name, value in expected.items()
+            if (observed.get(name) is True) != value}
+
+
+async def member_permissions(bot, cid):
+    chat = await bot.get_chat(cid)
     return chat.permissions or ChatPermissions(can_send_messages=True)
 
 
-async def change_lock(bot,cid,lock,reason):
-    g=get_group(cid)
-    if not g or not g['approved']:return
-    d=cfg(cid)
-    if lock and g['locked']:return
-    if not lock and not g['locked']:return
+async def change_lock(bot, cid, lock, reason):
+    g = get_group(cid)
+    if not g or not g['approved']:
+        return
+    if lock and g['locked']:
+        return
+    if not lock and not g['locked']:
+        return
+    d = cfg(cid)
     try:
         if lock:
-            chat=await bot.get_chat(cid)
-            original=permissions_to_dict(chat.permissions)
+            chat = await bot.get_chat(cid)
+            original = permissions_to_dict(chat.permissions)
             if not original:
-                log.error('Cannot lock %s without a complete permissions snapshot',cid)
+                log.error('Lock aborted: Telegram returned no group permissions for %s', cid)
                 return
-            await bot.set_chat_permissions(cid,ChatPermissions(can_send_messages=False,can_send_audios=False,can_send_documents=False,can_send_photos=False,can_send_videos=False,can_send_video_notes=False,can_send_voice_notes=False,can_send_polls=False,can_send_other_messages=False,can_add_web_page_previews=False),use_independent_chat_permissions=True)
-            set_group(cid,locked=1,permissions=json.dumps(original),lock_reason=reason)
-            key='holiday_lock_text' if reason=='holiday' else 'shabbat_lock_text' if reason=='shabbat' else 'lock_text'
+            # Persist BEFORE changing Telegram.  If the process stops mid-request,
+            # the original permissions are still recoverable.
+            set_group(cid, permissions=json.dumps(original), lock_reason=reason)
+            locked_permissions = ChatPermissions(**{
+                name: False for name in _PERMISSION_FIELDS
+            })
+            await bot.set_chat_permissions(
+                cid, locked_permissions, use_independent_chat_permissions=True
+            )
+            set_group(cid, locked=1)
+            key = ('holiday_lock_text' if reason == 'holiday' else
+                   'shabbat_lock_text' if reason == 'shabbat' else 'lock_text')
         else:
-            original=json.loads(g['permissions'] or '{}')
-            if not original:
-                log.error('Refusing to unlock %s without saved permissions',cid)
+            try:
+                saved = json.loads(g['permissions'] or '{}')
+            except (TypeError, ValueError):
+                saved = {}
+            if not isinstance(saved, dict) or not saved:
+                log.error('Unlock aborted: missing original permissions for %s', cid)
                 return
-            # Explicit False for omitted fields is essential: Telegram's defaults can
-            # otherwise enable media permissions when send_messages is True.
-            restored={key:bool(original.get(key)) for key in permissions_to_dict(ChatPermissions()).keys()}
-            await bot.set_chat_permissions(cid,ChatPermissions(**restored),use_independent_chat_permissions=True)
-            observed=permissions_to_dict((await bot.get_chat(cid)).permissions)
-            mismatches={key:(wanted,observed.get(key)) for key,wanted in restored.items()
-                        if bool(observed.get(key)) != wanted}
-            if mismatches:
-                log.warning('Permission restore mismatch for %s: %s; retrying',cid,mismatches)
-                await bot.set_chat_permissions(cid,ChatPermissions(**restored),use_independent_chat_permissions=True)
-                observed=permissions_to_dict((await bot.get_chat(cid)).permissions)
-                mismatches={key:(wanted,observed.get(key)) for key,wanted in restored.items()
-                            if bool(observed.get(key)) != wanted}
-                if mismatches:
-                    log.error('Permission restore verification failed for %s: %s',cid,mismatches)
-                    return
-            set_group(cid,locked=0,permissions=None,lock_reason=None)
-            key='holiday_unlock_text' if g['lock_reason']=='holiday' else 'shabbat_unlock_text' if g['lock_reason']=='shabbat' else 'unlock_text'
-        await send_formatted(bot,cid,d[key])
-        audit(cid,OWNER,'lock' if lock else 'unlock',reason)
-    except TelegramError:log.exception('Lock/unlock failed for %s',cid)
+            expected = _explicit_permissions(saved)
+            # A single explicit, independent restoration avoids Telegram's
+            # dependent-permission expansion, which may enable media implicitly.
+            await bot.set_chat_permissions(
+                cid, ChatPermissions(**expected),
+                use_independent_chat_permissions=True
+            )
+            observed = permissions_to_dict((await bot.get_chat(cid)).permissions)
+            differences = _permission_differences(expected, observed)
+            if differences:
+                log.error('Unlock permissions differ for group %s: %s', cid, differences)
+                # Keep the snapshot so a future unlock/recovery can retry.
+                # Do not claim success or silently grant more rights.
+                return
+            set_group(cid, locked=0, permissions=None, lock_reason=None)
+            key = ('holiday_unlock_text' if g['lock_reason'] == 'holiday' else
+                   'shabbat_unlock_text' if g['lock_reason'] == 'shabbat' else
+                   'unlock_text')
+        await send_formatted(bot, cid, d[key])
+        audit(cid, OWNER, 'lock' if lock else 'unlock', reason)
+    except TelegramError:
+        log.exception('Lock/unlock failed for %s', cid)
 
 
 JERUSALEM = Observer(latitude=31.778, longitude=35.235, elevation=750)

@@ -763,12 +763,12 @@ async def panel_update(bot,uid,text,reply_markup=None):
     loc=panel_location(uid)
     if loc:
         try:
-            await bot.edit_message_text(chat_id=loc[0],message_id=loc[1],text=str(text)[:4096],reply_markup=reply_markup)
+            await bot.edit_message_text(chat_id=loc[0],message_id=loc[1],text=render_text(text)[:4096] if str(text).startswith('HTML:') else str(text)[:4096],parse_mode=ParseMode.HTML if str(text).startswith('HTML:') else None,reply_markup=reply_markup)
             return
         except TelegramError as e:
             if 'not modified' in str(e).lower():return
             log.warning('Panel edit failed: %s',e)
-    msg=await bot.send_message(uid,str(text)[:4096],reply_markup=reply_markup)
+    msg=await bot.send_message(uid,render_text(text)[:4096] if str(text).startswith('HTML:') else str(text)[:4096],parse_mode=ParseMode.HTML if str(text).startswith('HTML:') else None,reply_markup=reply_markup)
     panel_remember(uid,msg.chat_id,msg.message_id)
 
 
@@ -1794,7 +1794,7 @@ async def export_file(bot,recipient,cid):
 def permissions_to_dict(p):
     if not p:return {}
     fields=('can_send_messages','can_send_audios','can_send_documents','can_send_photos','can_send_videos','can_send_video_notes','can_send_voice_notes','can_send_polls','can_send_other_messages','can_add_web_page_previews','can_change_info','can_invite_users','can_pin_messages','can_manage_topics')
-    return {k:getattr(p,k,None) for k in fields}
+    return {k:bool(getattr(p,k,None)) for k in fields}
 
 
 async def member_permissions(bot,cid):
@@ -1815,15 +1815,30 @@ async def change_lock(bot,cid,lock,reason):
             if not original:
                 log.error('Cannot lock %s without a complete permissions snapshot',cid)
                 return
-            set_group(cid,locked=1,permissions=json.dumps(original),lock_reason=reason)
             await bot.set_chat_permissions(cid,ChatPermissions(can_send_messages=False,can_send_audios=False,can_send_documents=False,can_send_photos=False,can_send_videos=False,can_send_video_notes=False,can_send_voice_notes=False,can_send_polls=False,can_send_other_messages=False,can_add_web_page_previews=False),use_independent_chat_permissions=True)
+            set_group(cid,locked=1,permissions=json.dumps(original),lock_reason=reason)
             key='holiday_lock_text' if reason=='holiday' else 'shabbat_lock_text' if reason=='shabbat' else 'lock_text'
         else:
             original=json.loads(g['permissions'] or '{}')
             if not original:
                 log.error('Refusing to unlock %s without saved permissions',cid)
                 return
-            await bot.set_chat_permissions(cid,ChatPermissions(**original),use_independent_chat_permissions=True)
+            # Explicit False for omitted fields is essential: Telegram's defaults can
+            # otherwise enable media permissions when send_messages is True.
+            restored={key:bool(original.get(key)) for key in permissions_to_dict(ChatPermissions()).keys()}
+            await bot.set_chat_permissions(cid,ChatPermissions(**restored),use_independent_chat_permissions=True)
+            observed=permissions_to_dict((await bot.get_chat(cid)).permissions)
+            mismatches={key:(wanted,observed.get(key)) for key,wanted in restored.items()
+                        if bool(observed.get(key)) != wanted}
+            if mismatches:
+                log.warning('Permission restore mismatch for %s: %s; retrying',cid,mismatches)
+                await bot.set_chat_permissions(cid,ChatPermissions(**restored),use_independent_chat_permissions=True)
+                observed=permissions_to_dict((await bot.get_chat(cid)).permissions)
+                mismatches={key:(wanted,observed.get(key)) for key,wanted in restored.items()
+                            if bool(observed.get(key)) != wanted}
+                if mismatches:
+                    log.error('Permission restore verification failed for %s: %s',cid,mismatches)
+                    return
             set_group(cid,locked=0,permissions=None,lock_reason=None)
             key='holiday_unlock_text' if g['lock_reason']=='holiday' else 'shabbat_unlock_text' if g['lock_reason']=='shabbat' else 'unlock_text'
         await send_formatted(bot,cid,d[key])

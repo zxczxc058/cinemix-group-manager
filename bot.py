@@ -880,6 +880,7 @@ def page_keyboard(cid,page):
                      [('⏱️ דקות אחרי צאת',f'edit:end_offset:{cid}')],
                      [('🌇 דקות אחרי שקיעה לצאת משוער',f'edit:nightfall_minutes:{cid}')]])
         for key,label in [('shabbat_lock_text','הודעת כניסת שבת'),('shabbat_unlock_text','הודעת צאת שבת'),('holiday_lock_text','הודעת כניסת חג'),('holiday_unlock_text','הודעת צאת חג')]:rows.append([(label,f'edit:{key}:{cid}')])
+    if page=='calendar':rows.append([('📅 זמני נעילה ופתיחה קרובים',f'calnext:show:{cid}')])
     if page=='replies':rows.extend([[('➕ הוספת תגובה מודרכת',f'wiz:reply:{cid}')],[('📋 רשימת תגובות / עריכה / מחיקה',f'show:replies:{cid}')]])
     if page=='announcements':rows.extend([[('➕ הודעה חוזרת כל X דקות/שעות',f'wiz:announcement:{cid}')],[('📋 רשימה / עריכה / מחיקה',f'show:announcements:{cid}')]])
     if page=='allowlist':rows.append([('📋 רשימת מורשים',f'show:allowlist:{cid}')])
@@ -915,6 +916,12 @@ async def callbacks(update,context):
         cid=0 if action in ('ownerexplain','ownertext') else int(cs)
     except Exception:
         await q.answer('שגיאה');return
+    # An owner explanation editor must not keep an unrelated pending input.
+    if action in ('ownerexplain','ownertext') and not (action=='ownertext' and value=='edit'):
+        with conn() as c:
+            pending_row=c.execute('SELECT field FROM pending_edits WHERE uid=?',(uid,)).fetchone()
+        if pending_row and pending_row['field'].startswith(('owner_text:', 'owner_explanation:')):
+            clear_pending(uid)
     if action in ('ownerexplain','ownertext'):
         if uid!=OWNER or q.message.chat.type!='private':
             await q.answer('רק בעל הבוט',show_alert=True);return
@@ -947,6 +954,12 @@ async def callbacks(update,context):
                 if kind=='detail':meta_set('explanation_override:'+key,'')
             text,markup=owner_text_actions(kind,key)
             await panel_from_query(q,('✅ הוחזר לברירת המחדל!\n\n' if value=='reset' else '✅ מצב ההסבר עודכן.\n\n' if value=='toggle' else '')+text,reply_markup=markup)
+        return
+    if action=='calnext':
+        if not await authorized(context.bot,uid,cid):
+            await q.answer('אין הרשאה',show_alert=True);return
+        await q.answer()
+        await panel_from_query(q,calendar_preview(cfg(cid)),reply_markup=kb([('🔄 רענון זמנים',f'calnext:show:{cid}')],[('⬅️ חזרה לשבת וחג',f'page:calendar:{cid}')]))
         return
     if action=='owner':
         if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
@@ -1907,6 +1920,53 @@ def shabbat(day):
 
 def sunset_local(day):
     return sun(JERUSALEM, date=day, tzinfo=TZ)['sunset']
+
+
+def calendar_preview(settings):
+    """Preview the same fixed lock times and sunset offsets used by calendar_tick.
+
+    This is a forecast, not a promise of exact scheduler execution time.
+    """
+    now = datetime.now(TZ)
+    intervals = []
+    for offset in range(370):
+        day = now.date() + timedelta(days=offset)
+        next_day = day + timedelta(days=1)
+        starts = []
+        if settings.get('shabbat') and day.weekday() == 4:
+            starts.append(('שבת', settings['friday_time']))
+        if settings.get('holiday') and yom_tov(next_day):
+            starts.append(('חג', settings['holiday_time']))
+        for label, clock in starts:
+            try:
+                hh, mm = map(int, clock.split(':'))
+                begin = datetime.combine(day,dt_time(hh,mm),tzinfo=TZ)
+                # End of a consecutive Shabbat/Yom Tov sequence.
+                last = next_day
+                while (settings.get('shabbat') and shabbat(last + timedelta(days=1))) or (settings.get('holiday') and yom_tov(last + timedelta(days=1))):
+                    last += timedelta(days=1)
+                end = sunset_local(last) + timedelta(minutes=int(settings['nightfall_minutes'])+int(settings['end_offset']))
+                if end > now:
+                    intervals.append((begin,end,label))
+            except (ValueError,TypeError,KeyError):
+                continue
+        if len(intervals)>15:break
+    intervals.sort(key=lambda x:x[0])
+    merged=[]
+    for begin,end,label in intervals:
+        if merged and begin <= merged[-1][1]:
+            old_begin,old_end,old_label=merged[-1]
+            merged[-1]=(old_begin,max(old_end,end),'שבת וחג' if label not in old_label else old_label)
+        else:merged.append((begin,end,label))
+    upcoming=[x for x in merged if x[1]>now][:3]
+    if not settings.get('shabbat') and not settings.get('holiday'):
+        return '📅 זמני נעילה ופתיחה קרובים\n\nשבת וחג כבויים. הפעילו אחת מהאפשרויות כדי לראות מועדים.'
+    lines=['📅 זמני נעילה ופתיחה קרובים','לפי שעון ירושלים (ישראל)\n']
+    for begin,end,label in upcoming:
+        lines.extend([f'🕯️ {label}',f'🔒 נעילה: {begin:%d/%m/%Y %H:%M}',f'🔓 פתיחה משוערת: {end:%d/%m/%Y %H:%M}',''])
+    if not upcoming:lines.append('לא נמצאו מועדים בטווח החיפוש.')
+    lines.append('⚠️ צאת שבת וחג מחושב לפי שקיעה בירושלים והתוספות שהוגדרו. זהו חישוב משוער, לא זמן הלכתי מוסמך. פתיחה בפועל תלויה בפעולת הבוט ובהגדרות נעילה אחרות.')
+    return '\n'.join(lines)
 
 
 async def calendar_tick(bot, cid, group_row, settings, now):

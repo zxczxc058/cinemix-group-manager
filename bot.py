@@ -19,7 +19,7 @@ from telegram import ChatPermissions, InlineKeyboardButton as B, InlineKeyboardM
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, ChatMemberHandler,
-                          CommandHandler, ContextTypes, MessageHandler, filters)
+                          CommandHandler, ContextTypes, MessageHandler, ApplicationHandlerStop, filters)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('cinemix')
@@ -86,6 +86,11 @@ def conn():
             c.execute('INSERT OR IGNORE INTO groups(id,title,approved,settings) VALUES (?,?,?,?)',
                       (old['chat_id'],old['title'],old['approved'],json.dumps(initial,ensure_ascii=False)))
         # Preserve the legacy table for recovery; no destructive migration.
+    c.execute('CREATE TABLE IF NOT EXISTS bot_users (uid INTEGER PRIMARY KEY, full_name TEXT, username TEXT, first_seen INTEGER, last_seen INTEGER, blocked INTEGER DEFAULT 0)')
+    c.execute('CREATE TABLE IF NOT EXISTS archived_groups (chat INTEGER PRIMARY KEY, archived_at INTEGER)')
+    c.execute('CREATE TABLE IF NOT EXISTS bot_user_blocks (uid INTEGER PRIMARY KEY, blocked_at INTEGER NOT NULL)')
+    c.execute('UPDATE bot_users SET blocked=1 WHERE uid IN (SELECT uid FROM bot_user_blocks)')
+    c.execute('INSERT OR IGNORE INTO bot_user_blocks(uid,blocked_at) SELECT uid,? FROM bot_users WHERE blocked=1',(int(time.time()),))
     c.execute('CREATE TABLE IF NOT EXISTS warnings (chat INTEGER, uid INTEGER, count INTEGER DEFAULT 0, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS seen (chat INTEGER, mid INTEGER, ts INTEGER, PRIMARY KEY(chat,mid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_verify (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
@@ -251,8 +256,14 @@ def set_group(cid, **kw):
         c.execute('UPDATE groups SET '+','.join(k+'=?' for k in kw)+' WHERE id=?',(*kw.values(),cid));c.commit()
 
 
+def is_bot_user_blocked(uid):
+    if uid==OWNER:return False
+    with conn() as c:
+        return c.execute('SELECT 1 FROM bot_user_blocks WHERE uid=?',(uid,)).fetchone() is not None
+
+
 def all_groups():
-    with conn() as c: return [dict(x) for x in c.execute('SELECT * FROM groups WHERE active=1 ORDER BY title')]
+    with conn() as c: return [dict(x) for x in c.execute('SELECT * FROM groups WHERE active=1 AND id NOT IN (SELECT chat FROM archived_groups) ORDER BY title')]
 
 
 def warn_count(cid,uid,delta=0):
@@ -386,6 +397,12 @@ async def request_group_approval(bot,chat,inviter=None,force=False):
             c.commit()
     if g['approved']:
         return 'approved'
+    # Re-register an archived group without resetting any of its saved settings.
+    with conn() as c:
+        c.execute('DELETE FROM archived_groups WHERE chat=?',(chat.id,))
+        c.execute('UPDATE groups SET active=1 WHERE id=?',(chat.id,))
+        c.execute('UPDATE group_requests SET notified=0 WHERE chat=?',(chat.id,))
+        c.commit()
     if force:
         # A manual /register repairs a missed owner notification from older builds.
         with conn() as c:
@@ -489,7 +506,9 @@ async def list_groups(bot,uid,cid):
     rows=[]
     for g in groups[:70]:
         rows.append([('⚙️ '+g['title'][:45],f'open:x:{g["id"]}')])
-        if uid==OWNER:rows.append([('❌ ביטול אישור' if g['approved'] else '✅ אישור',f'approval:{0 if g["approved"] else 1}:{g["id"]}')])
+        if uid==OWNER:
+            rows.append([('❌ ביטול אישור' if g['approved'] else '✅ אישור',f'approval:{0 if g["approved"] else 1}:{g["id"]}')])
+            if not g['approved']:rows.append([('🗑️ הסר מהרשימה',f'archive:ask:{g["id"]}')])
     if uid==OWNER:rows.append([('⬅️ חזרה לפאנל הבעלים','owner:overview:0')])
     await panel_update(bot,uid,'👥 קבוצות לניהול — בחר קבוצה:',kb(*rows))
 
@@ -624,7 +643,8 @@ def owner_text_actions(kind,key):
 def owner_menu():
     return kb(
         [('📊 תמונת מצב', 'owner:overview:0'),('👥 כל הקבוצות','list:all:0')],
-        [('📥 בקשות ממתינות','owner:pending:0'),('🩺 בריאות קבוצות','owner:health:0')],
+        [('📥 בקשות ממתינות','owner:pending:0'),('👤 משתמשי הבוט','botusers:list:0')],
+        [('🩺 בריאות קבוצות','owner:health:0')],
         [('📣 פרסום מרכזי','owner:broadcast:0'),('📈 פעילות מערכת','owner:metrics:0')],
         [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
         [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
@@ -719,6 +739,13 @@ async def show_start_text(update,context):
 
 async def start(update,context):
     if update.effective_chat.type!='private':return
+    u=update.effective_user
+    with conn() as c:
+        c.execute('INSERT INTO bot_users(uid,full_name,username,first_seen,last_seen) VALUES (?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET full_name=excluded.full_name,username=excluded.username,last_seen=excluded.last_seen',(u.id,u.full_name,u.username or '',int(time.time()),int(time.time())))
+        blocked=c.execute('SELECT 1 FROM bot_user_blocks WHERE uid=?',(u.id,)).fetchone() is not None
+        c.commit()
+    if u.id!=OWNER and blocked:
+        await update.message.reply_text('🚫 הגישה שלך לבוט נחסמה.');return
     if update.effective_user.id==OWNER:
         await owner_panel(update,context)
     else:
@@ -963,6 +990,9 @@ def edit_prompt(key):
 
 async def callbacks(update,context):
     q=update.callback_query;uid=q.from_user.id
+    if uid!=OWNER:
+        if is_bot_user_blocked(uid):
+            await q.answer('🚫 הגישה שלך לבוט נחסמה',show_alert=True);return
     if q.message and q.message.chat.type=='private' and q.data.split(':',1)[0] not in ('verify','warncancel','unmute','approval'):
         panel_remember(uid,q.message.chat_id,q.message.message_id)
     try:
@@ -976,6 +1006,64 @@ async def callbacks(update,context):
             pending_row=c.execute('SELECT field FROM pending_edits WHERE uid=?',(uid,)).fetchone()
         if pending_row and pending_row['field'].startswith(('owner_text:', 'owner_explanation:')):
             clear_pending(uid)
+    if action=='botusers':
+        if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
+        await q.answer()
+        if value=='list':
+            offset=max(0,int(cid))*20
+            with conn() as c:
+                users=c.execute('SELECT * FROM bot_users ORDER BY last_seen DESC,uid DESC LIMIT 20 OFFSET ?',(offset,)).fetchall()
+                total=c.execute('SELECT COUNT(*) FROM bot_users').fetchone()[0]
+            rows=[[(('🚫 ' if u['blocked'] else '👤 ')+(u['full_name'] or str(u['uid']))[:32],f'botusers:view:{u["uid"]}')] for u in users]
+            nav=[]
+            if offset>0:nav.append(('⬅️ הקודם',f'botusers:list:{max(0,int(cid)-1)}'))
+            if offset+20<total:nav.append(('הבא ➡️',f'botusers:list:{int(cid)+1}'))
+            if nav:rows.append(nav)
+            rows.extend([[('🔎 חיפוש לפי ID','botusers:search:0')],[('⬅️ חזרה','owner:overview:0')]])
+            await panel_from_query(q,f'👥 משתמשי הבוט: {total}\nעמוד {int(cid)+1}',reply_markup=kb(*rows));return
+        if value=='search':
+            pending_set(uid,0,'botusers_search')
+            await panel_from_query(q,'🔎 שלח מזהה משתמש מספרי. /cancel לביטול.',reply_markup=kb([('⬅️ חזרה','botusers:list:0')]));return
+        if value=='view':
+            with conn() as c:r=c.execute('SELECT * FROM bot_users WHERE uid=?',(cid,)).fetchone()
+            if not r:await panel_from_query(q,'משתמש לא נמצא.',reply_markup=kb([('⬅️ חזרה','botusers:list:0')]));return
+            import datetime as _dt
+            first=_dt.datetime.fromtimestamp(r['first_seen']).strftime('%Y-%m-%d')
+            txt=f'👤 {r["full_name"]}\nID: {cid}\n@{r["username"] or "ללא"}\nהפעלה ראשונה: {first}\nמצב: {"חסום" if r["blocked"] else "פעיל"}'
+            await panel_from_query(q,txt,reply_markup=kb([('✅ בטל חסימה' if r['blocked'] else '🚫 חסום משתמש',f'botusers:toggle:{cid}')],[('🗑️ הסר מהרשימה',f'botusers:removeask:{cid}')],[('⬅️ משתמשים','botusers:list:0')]));return
+        if value=='toggle':
+            if cid==OWNER:
+                await panel_from_query(q,'לא ניתן לחסום את בעל הבוט.');return
+            with conn() as c:
+                current=c.execute('SELECT 1 FROM bot_user_blocks WHERE uid=?',(cid,)).fetchone()
+                if current:
+                    c.execute('DELETE FROM bot_user_blocks WHERE uid=?',(cid,))
+                    c.execute('UPDATE bot_users SET blocked=0 WHERE uid=?',(cid,))
+                else:
+                    c.execute('INSERT OR REPLACE INTO bot_user_blocks(uid,blocked_at) VALUES (?,?)',(cid,int(time.time())))
+                    c.execute('UPDATE bot_users SET blocked=1 WHERE uid=?',(cid,))
+                c.commit()
+            await panel_from_query(q,'✅ סטטוס החסימה עודכן.',reply_markup=kb([('⬅️ משתמש','botusers:view:'+str(cid))]));return
+        if value=='removeask':
+            await panel_from_query(q,'⚠️ להסיר משתמש מהרשימה? אם יפעיל /start שוב הוא יירשם מחדש. חסימה קיימת תישמר.',reply_markup=kb([('🗑️ אשר הסרה',f'botusers:remove:{cid}')],[('❌ ביטול',f'botusers:view:{cid}')]));return
+        if value=='remove':
+            with conn() as c:c.execute('DELETE FROM bot_users WHERE uid=?',(cid,));c.commit()
+            await panel_from_query(q,'✅ הוסר מהרשימה.',reply_markup=kb([('⬅️ משתמשים','botusers:list:0')]));return
+        return
+    if action=='archive':
+        if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
+        g=get_group(cid)
+        if not g:await q.answer('קבוצה לא נמצאה');return
+        if g['approved']:await q.answer('יש לבטל אישור תחילה',show_alert=True);return
+        await q.answer()
+        if value=='ask':
+            await panel_from_query(q,'🗑️ להסיר את '+g['title']+' מהרשימה? כל ההגדרות יישמרו.',reply_markup=kb([('🗑️ אשר הסרה',f'archive:confirm:{cid}')],[('❌ ביטול','list:all:0')]));return
+        if value=='confirm':
+            with conn() as c:
+                c.execute('INSERT OR REPLACE INTO archived_groups(chat,archived_at) VALUES (?,?)',(cid,int(time.time())))
+                c.commit()
+            await list_groups(context.bot,uid,q.message.chat_id);return
+        return
     if action=='access':
         if uid!=OWNER or q.message.chat.type!='private':await q.answer('רק בעל הבוט',show_alert=True);return
         await q.answer()
@@ -1124,7 +1212,10 @@ async def callbacks(update,context):
     if action=='approval':
         if uid!=OWNER:await q.answer('רק בעל הבוט',show_alert=True);return
         if not get_group(cid):await q.answer('קבוצה לא נמצאה');return
-        set_group(cid,approved=int(value));await q.answer('עודכן')
+        set_group(cid,approved=int(value));
+        if value=='1':
+            with conn() as c:c.execute('DELETE FROM archived_groups WHERE chat=?',(cid,));c.commit()
+        await q.answer('עודכן')
         with conn() as c:
             c.execute('DELETE FROM group_requests WHERE chat=?',(cid,))
             inviter=c.execute('SELECT inviter FROM invitations WHERE chat=?',(cid,)).fetchone()
@@ -1491,6 +1582,16 @@ async def input_private(update,context):
         clear_pending(uid)
         await deliver_system(context.bot,'access_granted' if action=='allow' else 'access_revoked',group=cid,person=target,variables={'group':(get_group(cid) or {}).get('title',str(cid))})
         await panel_from_input(update,context,'✅ הרשאות עודכנו עבור '+str(target),reply_markup=kb([('👮 חזרה לרשימת הרשאות',f'access:group:{cid}')]));return
+    if key=='botusers_search':
+        clear_pending(uid)
+        raw=(update.message.text or '').strip()
+        if not raw.isdigit():
+            await panel_update(context.bot,uid,'❌ יש לשלוח מזהה מספרי בלבד.',kb([('⬅️ משתמשים','botusers:list:0')]))
+            return
+        target=int(raw)
+        with conn() as c:r=c.execute('SELECT uid FROM bot_users WHERE uid=?',(target,)).fetchone()
+        await panel_update(context.bot,uid,'👤 משתמש נמצא' if r else 'לא נמצא משתמש עם מזהה זה.',kb([('👤 הצג משתמש',f'botusers:view:{target}')],[('⬅️ משתמשים','botusers:list:0')]) if r else kb([('⬅️ משתמשים','botusers:list:0')]))
+        return
     if key.startswith('owner_text:'):
         if uid!=OWNER:return
         _,kind,text_key=key.split(':',2)
@@ -1896,6 +1997,7 @@ async def run_replies(bot,cid,settings,text,user,reply_to):
 
 async def commands(update,context):
     msg=update.message;cid=msg.chat_id;u=msg.from_user;cmd=msg.text.split()[0].split('@')[0].lower().lstrip('/')
+    if is_bot_user_blocked(u.id):return
     if not await authorized(context.bot,u.id,cid):return
     g=get_group(cid)
     if not g or not g['approved']:return
@@ -2261,10 +2363,22 @@ async def cleanup_slash_commands(update,context):
         await safe_delete(context.bot,msg.chat_id,msg.message_id)
 
 
+async def blocked_user_guard(update,context):
+    user=update.effective_user
+    if not user or not is_bot_user_blocked(user.id):return
+    # Callbacks show a popup in the existing callback handler.
+    if update.callback_query:return
+    chat=update.effective_chat
+    if chat and chat.type=='private' and update.effective_message:
+        await update.effective_message.reply_text('🚫 הגישה שלך לבוט נחסמה.')
+    raise ApplicationHandlerStop
+
+
 def main():
     if not TOKEN:raise RuntimeError('Set BOT_TOKEN in Render environment variables')
     conn().close()
     app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.ALL,blocked_user_guard),group=-1)
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CommandHandler('admin',owner_panel))
     app.add_handler(CommandHandler('setstart',set_start_text))

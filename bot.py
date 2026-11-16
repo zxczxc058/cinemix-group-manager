@@ -30,11 +30,12 @@ TZ = ZoneInfo('Asia/Jerusalem')
 FLOODS = defaultdict(deque)
 PENDING = {}
 LAST_WELCOME = {}
+RECENT_JOINS = {}
 
 DEFAULT = {
  'links': True, 'max_warn': 3, 'delete_slash_commands': True, 'welcome': True, 'welcome_text': '👋 ברוך הבא {user}!\nשמחים שהצטרפת אלינו 💜',
  'welcome_buttons': [], 'welcome_media': None, 'welcome_seconds': 300,
- 'service_delete': True, 'channel_posts_delete': False, 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
+ 'service_delete': True, 'channel_posts_delete': False, 'required_channel': '', 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
  'flood': False, 'flood_count': 5, 'flood_seconds': 10, 'flood_mute': 1800,
  'words': [], 'word_action': 'delete', 'word_mute': 1800,
  'lock_text': '🔒 הקבוצה ננעלה', 'unlock_text': '🔓 הקבוצה נפתחה',
@@ -58,6 +59,7 @@ HELP = {
  'users': '👮 ניהול משתמשים: הגיבו להודעה עם /warn [סיבה], /mute 30m [סיבה], /unmute, /ban [סיבה], /unban (לפי מזהה). /warnings בתגובה מציג אזהרות. /clean 50 מוחק הודעות אחרונות שנצפו.',
  'replies': '🤖 תגובות: הגדירו טריגר, מצב exact או contains, טקסט וכפתורים. ההודעה המקורית והתגובה נשארות.',
  'announcements': '📢 הודעות אוטומטיות: לחץ על ״הוספת פרסום אוטומטי מודרך״, הגדר מרווח בדקות (למשל 180 = 3 שעות), הזן הודעה ואשר. דרך הרשימה אפשר לערוך, למחוק, להשהות ולהגדיר מחיקת הודעה קודמת. בזמן נעילה הפרסומים מושהים.',
+ 'subscription': '📢 חובת הצטרפות לערוץ: הגדר ערוץ ציבורי באמצעות @username או מזהה מספרי של ערוץ פרטי. הבוט חייב להיות מנהל בערוץ. ניתן להפעיל יחד עם אימות אני לא רובוט. משתמש חדש יוכל לכתוב רק לאחר השלמת שתי הדרישות הפעילות.',
  'verify': '✅ אימות: משתמש חדש מוגבל עד שילחץ על כפתור האימות. אין הרחקה אוטומטית. לאחר אימות תישלח ברכת הצטרפות.',
  'backup': '📦 /export בקבוצה או /export <group_id> בפרטי. שלחו את קובץ JSON לקבוצה אחרת והגיבו לו עם /import. כל ההגדרות יוחלפו לאחר אישור.',
  'channels': '📣 הודעות בשם ערוץ: הפעלה מוחקת הודעות שנשלחו בשם ערוץ או כערוץ מחובר, ולא הודעות רגילות של משתמשים. מנהלים יכולים לשנות בפרטי.',
@@ -94,6 +96,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS warnings (chat INTEGER, uid INTEGER, count INTEGER DEFAULT 0, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS seen (chat INTEGER, mid INTEGER, ts INTEGER, PRIMARY KEY(chat,mid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_verify (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS pending_subscription (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS welcomes (chat INTEGER PRIMARY KEY, mid INTEGER, expires INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS mutes (chat INTEGER, uid INTEGER, original TEXT, PRIMARY KEY(chat,uid))')
@@ -485,6 +488,7 @@ def menu(cid):
         [('🗑️ מחיקת פקודות',f'page:command_cleanup:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
         [('🛡️ אנטי ספאם',f'page:flood:{cid}'),('🚫 מילים אסורות',f'page:words:{cid}')],
         [('👋 ברוכים הבאים',f'page:welcome:{cid}'),('✅ אימות',f'page:verify:{cid}')],
+        [('📢 חובת הצטרפות לערוץ',f'page:subscription:{cid}')],
         [('🔒 נעילה',f'page:lock:{cid}'),('🕯️ שבת וחג',f'page:calendar:{cid}')],
         [('👮 משתמשים',f'page:users:{cid}'),('🛡️ מורשים',f'page:allowlist:{cid}')],
         [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🤖 תגובות',f'page:replies:{cid}')],
@@ -902,7 +906,7 @@ FIELD_PAGES = {
     'holiday_time':'calendar','end_offset':'calendar','nightfall_minutes':'calendar',
     'shabbat_lock_text':'calendar','shabbat_unlock_text':'calendar',
     'holiday_lock_text':'calendar','holiday_unlock_text':'calendar',
-    'verify':'verify','verify_text':'verify','rules_welcome_button':'welcome','service_delete':'service','channel_posts_delete':'channels',
+    'required_channel':'subscription','verify':'verify','verify_text':'verify','rules_welcome_button':'welcome','service_delete':'service','channel_posts_delete':'channels',
     'stealth':'stealth','forward_filter':'forward','rules_text':'rules',
     'delete_slash_commands':'command_cleanup','rules_popup_custom':'rules',
 }
@@ -937,6 +941,9 @@ def page_keyboard(cid,page):
     if page=='audit':rows.append([('📋 20 פעולות אחרונות',f'auditshow:x:{cid}')])
     if page=='command_cleanup':rows.append([('🟢 פעיל' if d['delete_slash_commands'] else '🔴 כבוי',f'toggle:delete_slash_commands:{cid}')])
     if page=='links':rows.append([(f'⚠️ אזהרות: {d["max_warn"]}',f'edit:max_warn:{cid}')])
+    if page=='subscription':
+        rows.append([('📢 ערוץ: '+(str(d.get('required_channel')) or 'לא הוגדר'),f'edit:required_channel:{cid}')])
+        if d.get('required_channel'):rows.append([('❌ ביטול חובת הצטרפות',f'subclear:x:{cid}')])
     if page=='verify':rows.append([('✏️ עריכת הודעת אימות',f'edit:verify_text:{cid}')])
     if page=='welcome':
         rows.append([('📜 כפתור חוקי הקבוצה: '+('פעיל 🟢' if d.get('rules_welcome_button') else 'כבוי 🔴'),f'toggle:rules_welcome_button:{cid}')])
@@ -977,6 +984,7 @@ EDIT_PROMPTS = {
     'daily_unlock_time': '🔓 שעת פתיחה יומית\nשלח שעה בפורמט HH:MM, למשל 07:00.\n/cancel לביטול.',
     'friday_time': '🕯️ שעת נעילה ביום שישי\nשלח שעה בפורמט HH:MM, למשל 13:00.\n/cancel לביטול.',
     'holiday_time': '🕯️ שעת נעילה בערב חג\nשלח שעה בפורמט HH:MM, למשל 14:00.\n/cancel לביטול.',
+    'required_channel': '📢 שלח @username של ערוץ ציבורי או מזהה מספרי של ערוץ פרטי. הבוט חייב להיות מנהל בערוץ. /cancel לביטול.',
     'verify_text': '🛡️ שלח הודעת אימות חדשה. אפשר להשתמש ב-{mention} לתיוג לחיץ, {username} ליוזר ו-{name} לשם.\n/cancel לביטול.',
     'welcome_buttons': '🔘 שלח כל כפתור בשורה נפרדת: כותרת | https://example.com\n/cancel לביטול.',
     'words': '🚫 שלח מילים אסורות מופרדות בפסיקים.\n/cancel לביטול.',
@@ -1244,16 +1252,25 @@ async def callbacks(update,context):
         d=cfg(cid)
         await q.answer(rules_popup_text(d.get('rules_popup_custom') or d.get('rules_text','')),show_alert=True)
         return
+    if action=='subcheck':
+        if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
+        if await subscription_member(context.bot,cid,uid):
+            with conn() as c:c.execute('DELETE FROM pending_subscription WHERE chat=? AND uid=?',(cid,uid));c.commit()
+            await q.answer('ההצטרפות אומתה!')
+            await complete_join(context.bot,cid,q.from_user,context)
+        else:await q.answer('לא נמצאה הצטרפות לערוץ. ודא שהצטרפת ונסה שוב.',show_alert=True)
+        return
     if action=='verify':
         if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
         with conn() as c:
             exists=c.execute('SELECT 1 FROM pending_verify WHERE chat=? AND uid=?',(cid,uid)).fetchone()
         if not exists:await q.answer('כבר אומת');return
         try:
-            await context.bot.restrict_chat_member(cid,uid,permissions=await member_permissions(context.bot,cid))
             with conn() as c:c.execute('DELETE FROM pending_verify WHERE chat=? AND uid=?',(cid,uid));c.commit()
-            await q.answer('אומתת בהצלחה!');await q.message.delete()
-            if cfg(cid)['welcome']:await welcome(context.bot,cid,q.from_user,context)
+            await q.answer('אומתת בהצלחה!')
+            try:await q.message.delete()
+            except TelegramError:pass
+            await complete_join(context.bot,cid,q.from_user,context)
         except TelegramError:await q.answer('שגיאה באימות',show_alert=True)
         return
     if not await authorized(context.bot,uid,cid):
@@ -1437,6 +1454,18 @@ async def callbacks(update,context):
     if action=='help':
         await q.answer();await panel_from_query(q,explanation_text(value),reply_markup=kb([('⬅️ חזרה',f'page:{value}:{cid}')]))
         return
+    if action=='subclear':
+        set_cfg(cid,'required_channel','')
+        await q.answer('החובה בוטלה; משתמשים שממתינים עדיין צריכים להשלים אימות פעיל')
+        with conn() as c:
+            users=c.execute('SELECT uid FROM pending_subscription WHERE chat=?',(cid,)).fetchall()
+            c.execute('DELETE FROM pending_subscription WHERE chat=?',(cid,));c.commit()
+        for item in users:
+            try:
+                member=await context.bot.get_chat_member(cid,item['uid'])
+                await complete_join(context.bot,cid,member.user,context)
+            except TelegramError:log.exception('Unable to release subscription restriction for %s',item['uid'])
+        await refresh_settings(q,cid,'subscription','✅ חובת הצטרפות בוטלה.');return
     if action=='toggle':
         if value not in ('links','welcome','flood','verify','service_delete','channel_posts_delete','shabbat','holiday','daily_lock','stealth','delete_slash_commands','rules_welcome_button'):await q.answer('לא נתמך');return
         new_state=not cfg(cid)[value]
@@ -1669,6 +1698,11 @@ async def input_private(update,context):
         if key in ('max_warn','welcome_seconds','flood_count','flood_seconds','flood_mute','word_mute','end_offset','nightfall_minutes'):
             val=int(raw);assert 0<=val<=86400
             if key in ('max_warn','flood_count','flood_seconds'):assert val>0
+        elif key=='required_channel':
+            val=raw.strip()
+            assert re.fullmatch(r'@[A-Za-z0-9_]{5,32}|-100[0-9]{5,}',val)
+            member=await context.bot.get_chat_member(val,(await context.bot.get_me()).id)
+            assert member.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
         elif key in ('friday_time','holiday_time','daily_lock_time','daily_unlock_time'):
             assert re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d',raw);val=raw
         elif key in ('welcome_buttons',):
@@ -1883,21 +1917,87 @@ async def delete_welcome(context):
         with conn() as c:c.execute('DELETE FROM welcomes WHERE chat=? AND mid=?',(cid,mid));c.commit()
 
 
-async def new_members(update,context):
-    msg=update.message;cid=msg.chat_id;g=get_group(cid)
-    if not g or not g['approved']:return
+async def subscription_member(bot,cid,uid):
+    channel=cfg(cid).get('required_channel','')
+    if not channel:return True
+    try:
+        member=await bot.get_chat_member(channel,uid)
+        return member.status in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER) or (member.status==ChatMemberStatus.RESTRICTED and member.is_member)
+    except TelegramError:
+        log.exception('Cannot verify membership in channel %s',channel)
+        return False
+
+
+async def complete_join(bot,cid,user,context):
+    """Release only after every configured requirement is satisfied."""
+    with conn() as c:
+        verify=c.execute('SELECT 1 FROM pending_verify WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
+        subscribe=c.execute('SELECT 1 FROM pending_subscription WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
+    if verify or subscribe:return False
+    await bot.restrict_chat_member(cid,user.id,permissions=await member_permissions(bot,cid))
+    if cfg(cid)['welcome']:await welcome(bot,cid,user,context)
+    return True
+
+
+async def process_new_member(bot,cid,user,context):
+    if user.is_bot:return
+    now=time.monotonic()
+    key=(cid,user.id)
+    if now-RECENT_JOINS.get(key,0)<20:return
+    RECENT_JOINS[key]=now
+    if len(RECENT_JOINS)>5000:
+        for k,t in list(RECENT_JOINS.items()):
+            if now-t>60:RECENT_JOINS.pop(k,None)
     d=cfg(cid)
-    if d['service_delete']:await safe_delete(context.bot,cid,msg.message_id)
+    metric(cid,'joins')
+    need_sub=bool(d.get('required_channel')) and not await subscription_member(bot,cid,user.id)
+    need_verify=bool(d.get('verify'))
+    if need_verify or need_sub:
+        # Restrict first, and only persist pending checks after successful restriction.
+        await bot.restrict_chat_member(cid,user.id,permissions=ChatPermissions(can_send_messages=False))
+        with conn() as c:
+            if need_verify:c.execute('INSERT OR IGNORE INTO pending_verify VALUES (?,?)',(cid,user.id))
+            if need_sub:c.execute('INSERT OR IGNORE INTO pending_subscription VALUES (?,?)',(cid,user.id))
+            c.commit()
+        if need_verify:
+            await send_formatted(bot,cid,d['verify_text'],user,kb([('✅ אני לא רובוט',f'verify:{user.id}:{cid}')]))
+        if need_sub:
+            channel=d['required_channel']
+            rows=[]
+            if channel.startswith('@'):rows.append([B('📢 מעבר לערוץ',url='https://t.me/'+channel[1:])])
+            rows.append([B('✅ בדיקת הצטרפות',callback_data=f'subcheck:{user.id}:{cid}')])
+            await send_formatted(bot,cid,'📢 {user}, כדי להשתתף בקבוצה יש להצטרף לערוץ וללחוץ על בדיקת הצטרפות.',user,K(rows))
+    elif d['welcome']:
+        await welcome(bot,cid,user,context)
+
+
+async def new_members(update,context):
+    msg=update.message
+    if not msg:return
+    cid=msg.chat_id;g=get_group(cid)
+    if not g or not g['approved'] or not g.get('active',1):return
+    if cfg(cid)['service_delete']:await safe_delete(context.bot,cid,msg.message_id)
     for user in msg.new_chat_members:
-        if user.is_bot:continue
-        metric(cid,'joins')
-        if d['verify']:
-            try:
-                await context.bot.restrict_chat_member(cid,user.id,permissions=ChatPermissions(can_send_messages=False))
-                with conn() as c:c.execute('INSERT OR IGNORE INTO pending_verify VALUES (?,?)',(cid,user.id));c.commit()
-                await send_formatted(context.bot,cid,d['verify_text'],user,kb([('✅ אני לא רובוט',f'verify:{user.id}:{cid}')]))
-            except TelegramError:log.exception('Verification permissions missing')
-        elif d['welcome']:await welcome(context.bot,cid,user,context)
+        try:await process_new_member(context.bot,cid,user,context)
+        except TelegramError:log.exception('New member setup failed for %s in %s',user.id,cid)
+
+
+async def member_join_update(update,context):
+    event=update.chat_member
+    if not event:return
+    cid=event.chat.id;g=get_group(cid)
+    if not g or not g['approved'] or not g.get('active',1):return
+    before=event.old_chat_member.status;after=event.new_chat_member.status
+    was_in=before in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER) or (before==ChatMemberStatus.RESTRICTED and event.old_chat_member.is_member)
+    is_in=after in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER) or (after==ChatMemberStatus.RESTRICTED and event.new_chat_member.is_member)
+    if not was_in and is_in:
+        user=event.new_chat_member.user
+        try:
+            with conn() as c:
+                pending=c.execute('SELECT 1 FROM pending_verify WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
+                pending_sub=c.execute('SELECT 1 FROM pending_subscription WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
+            if not pending and not pending_sub:await process_new_member(context.bot,cid,user,context)
+        except TelegramError:log.exception('Chat member join processing failed')
 
 
 async def service(update,context):
@@ -2391,6 +2491,7 @@ def main():
     app.add_handler(CommandHandler('skip',panel_skip_handler))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(ChatMemberHandler(my_member,ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(member_join_update,ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT|filters.PHOTO|filters.VIDEO) & ~filters.COMMAND,panel_input_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS,new_members))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.StatusUpdate.LEFT_CHAT_MEMBER|filters.StatusUpdate.NEW_CHAT_TITLE|filters.StatusUpdate.NEW_CHAT_PHOTO|filters.StatusUpdate.DELETE_CHAT_PHOTO|filters.StatusUpdate.PINNED_MESSAGE),service))

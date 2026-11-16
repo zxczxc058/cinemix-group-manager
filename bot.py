@@ -35,7 +35,7 @@ RECENT_JOINS = {}
 DEFAULT = {
  'links': True, 'max_warn': 3, 'delete_slash_commands': True, 'welcome': True, 'welcome_text': '👋 ברוך הבא {user}!\nשמחים שהצטרפת אלינו 💜',
  'welcome_buttons': [], 'welcome_media': None, 'welcome_seconds': 300,
- 'service_delete': True, 'channel_posts_delete': False, 'required_channel': '', 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
+ 'service_delete': True, 'channel_posts_delete': False, 'required_channel': '', 'subscription_url': '', 'subscription_text': '📢 {user}, כדי להשתתף בקבוצה יש להצטרף לערוץ ולאשר את ההצטרפות.', 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
  'flood': False, 'flood_count': 5, 'flood_seconds': 10, 'flood_mute': 1800,
  'words': [], 'word_action': 'delete', 'word_mute': 1800,
  'lock_text': '🔒 הקבוצה ננעלה', 'unlock_text': '🔓 הקבוצה נפתחה',
@@ -943,6 +943,8 @@ def page_keyboard(cid,page):
     if page=='links':rows.append([(f'⚠️ אזהרות: {d["max_warn"]}',f'edit:max_warn:{cid}')])
     if page=='subscription':
         rows.append([('📢 ערוץ: '+(str(d.get('required_channel')) or 'לא הוגדר'),f'edit:required_channel:{cid}')])
+        rows.append([('🔗 קישור הצטרפות לערוץ',f'edit:subscription_url:{cid}')])
+        rows.append([('✏️ עריכת הודעת הצטרפות',f'edit:subscription_text:{cid}')])
         if d.get('required_channel'):rows.append([('❌ ביטול חובת הצטרפות',f'subclear:x:{cid}')])
     if page=='verify':rows.append([('✏️ עריכת הודעת אימות',f'edit:verify_text:{cid}')])
     if page=='welcome':
@@ -984,6 +986,8 @@ EDIT_PROMPTS = {
     'daily_unlock_time': '🔓 שעת פתיחה יומית\nשלח שעה בפורמט HH:MM, למשל 07:00.\n/cancel לביטול.',
     'friday_time': '🕯️ שעת נעילה ביום שישי\nשלח שעה בפורמט HH:MM, למשל 13:00.\n/cancel לביטול.',
     'holiday_time': '🕯️ שעת נעילה בערב חג\nשלח שעה בפורמט HH:MM, למשל 14:00.\n/cancel לביטול.',
+    'subscription_url': '🔗 שלח קישור הצטרפות לערוץ (https://t.me/...) או ״מחק״ כדי להסיר קישור מותאם. לערוץ ציבורי ניתן להשתמש ב-@username. /cancel לביטול.',
+    'subscription_text': '✏️ שלח את הודעת חובת ההצטרפות החדשה. אפשר להשתמש ב-{mention}, {username}, {name}. הכפתורים מתווספים אוטומטית. /cancel לביטול.',
     'required_channel': '📢 שלח @username של ערוץ ציבורי או מזהה מספרי של ערוץ פרטי. הבוט חייב להיות מנהל בערוץ. /cancel לביטול.',
     'verify_text': '🛡️ שלח הודעת אימות חדשה. אפשר להשתמש ב-{mention} לתיוג לחיץ, {username} ליוזר ו-{name} לשם.\n/cancel לביטול.',
     'welcome_buttons': '🔘 שלח כל כפתור בשורה נפרדת: כותרת | https://example.com\n/cancel לביטול.',
@@ -1703,6 +1707,13 @@ async def input_private(update,context):
             assert re.fullmatch(r'@[A-Za-z0-9_]{5,32}|-100[0-9]{5,}',val)
             member=await context.bot.get_chat_member(val,(await context.bot.get_me()).id)
             assert member.status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.OWNER)
+        elif key=='subscription_url':
+            val=raw.strip()
+            if val.lower() in ('מחק','remove'):val=''
+            else:assert re.fullmatch(r'https://t\.me/(?:\+[A-Za-z0-9_-]+|[A-Za-z0-9_]{5,32})',val)
+        elif key=='subscription_text':
+            val=message_formatted(update.message).strip()
+            assert val and len(val)<=3500
         elif key in ('friday_time','holiday_time','daily_lock_time','daily_unlock_time'):
             assert re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d',raw);val=raw
         elif key in ('welcome_buttons',):
@@ -1964,9 +1975,11 @@ async def process_new_member(bot,cid,user,context):
         if need_sub:
             channel=d['required_channel']
             rows=[]
-            if channel.startswith('@'):rows.append([B('📢 מעבר לערוץ',url='https://t.me/'+channel[1:])])
-            rows.append([B('✅ בדיקת הצטרפות',callback_data=f'subcheck:{user.id}:{cid}')])
-            await send_formatted(bot,cid,'📢 {user}, כדי להשתתף בקבוצה יש להצטרף לערוץ וללחוץ על בדיקת הצטרפות.',user,K(rows))
+            url=d.get('subscription_url','')
+            if not url and channel.startswith('@'):url='https://t.me/'+channel[1:]
+            if url:rows.append([B('📢 הצטרפות לערוץ',url=url)])
+            rows.append([B('✅ אישור הצטרפות',callback_data=f'subcheck:{user.id}:{cid}')])
+            await send_formatted(bot,cid,d.get('subscription_text') or DEFAULT['subscription_text'],user,K(rows))
     elif d['welcome']:
         await welcome(bot,cid,user,context)
 

@@ -98,6 +98,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS pending_verify (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_subscription (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS subscription_prompts (chat INTEGER, uid INTEGER, mid INTEGER, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS subscription_rechecks (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS welcomes (chat INTEGER PRIMARY KEY, mid INTEGER, expires INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS mutes (chat INTEGER, uid INTEGER, original TEXT, PRIMARY KEY(chat,uid))')
@@ -1272,7 +1273,12 @@ async def callbacks(update,context):
                 # Backward compatibility for prompts sent before this update.
                 await safe_delete(context.bot,cid,q.message.message_id)
             await q.answer('ההצטרפות אומתה!')
-            await complete_join(context.bot,cid,q.from_user,context)
+            with conn() as c:
+                recheck=bool(c.execute('SELECT 1 FROM subscription_rechecks WHERE chat=? AND uid=?',(cid,uid)).fetchone())
+            completed=await complete_join(context.bot,cid,q.from_user,context,send_welcome=not recheck)
+            if completed and recheck:
+                with conn() as c:
+                    c.execute('DELETE FROM subscription_rechecks WHERE chat=? AND uid=?',(cid,uid));c.commit()
         else:await q.answer('לא נמצאה הצטרפות לערוץ. ודא שהצטרפת ונסה שוב.',show_alert=True)
         return
     if action=='verify':
@@ -1967,14 +1973,14 @@ async def subscription_member(bot,cid,uid):
         return False
 
 
-async def complete_join(bot,cid,user,context):
+async def complete_join(bot,cid,user,context,send_welcome=True):
     """Release only after every configured requirement is satisfied."""
     with conn() as c:
         verify=c.execute('SELECT 1 FROM pending_verify WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
         subscribe=c.execute('SELECT 1 FROM pending_subscription WHERE chat=? AND uid=?',(cid,user.id)).fetchone()
     if verify or subscribe:return False
     await bot.restrict_chat_member(cid,user.id,permissions=await member_permissions(bot,cid))
-    if cfg(cid)['welcome']:await welcome(bot,cid,user,context)
+    if send_welcome and cfg(cid)['welcome']:await welcome(bot,cid,user,context)
     return True
 
 
@@ -2013,6 +2019,54 @@ async def process_new_member(bot,cid,user,context):
                 c.commit()
     elif d['welcome']:
         await welcome(bot,cid,user,context)
+
+
+async def enforce_ongoing_subscription(update,context):
+    """Check channel membership on each group message, including existing members.
+
+    Rechecking membership never triggers the first-join welcome message.
+    """
+    msg=update.effective_message
+    chat=update.effective_chat
+    user=update.effective_user
+    if not msg or not chat or chat.type not in ('group','supergroup') or not user or user.is_bot:
+        return
+    if msg.new_chat_members or msg.left_chat_member or msg.sender_chat:
+        return
+    cid=chat.id
+    group=get_group(cid)
+    if not group or not group['approved'] or not group.get('active',1):return
+    settings=cfg(cid)
+    if not settings.get('subscription_enabled',True) or not settings.get('required_channel'):return
+    if await authorized(context.bot,user.id,cid):return
+    with conn() as c:
+        pending=bool(c.execute('SELECT 1 FROM pending_subscription WHERE chat=? AND uid=?',(cid,user.id)).fetchone())
+    if not pending and await subscription_member(context.bot,cid,user.id):return
+    # A message that arrives while the user is not subscribed must not remain visible.
+    await safe_delete(context.bot,cid,msg.message_id)
+    if pending:raise ApplicationHandlerStop
+    try:
+        await context.bot.restrict_chat_member(cid,user.id,permissions=ChatPermissions(can_send_messages=False))
+    except TelegramError:
+        log.exception('Cannot restrict unsubscribed user %s in %s',user.id,cid)
+        raise ApplicationHandlerStop
+    with conn() as c:
+        c.execute('INSERT OR IGNORE INTO pending_subscription(chat,uid) VALUES (?,?)',(cid,user.id))
+        c.execute('INSERT OR IGNORE INTO subscription_rechecks(chat,uid) VALUES (?,?)',(cid,user.id))
+        c.commit()
+    channel=settings['required_channel']
+    url=settings.get('subscription_url','')
+    if not url and channel.startswith('@'):url='https://t.me/'+channel[1:]
+    rows=[]
+    if url:rows.append([B('📢 הצטרפות לערוץ',url=url)])
+    rows.append([B('✅ אישור הצטרפות',callback_data=f'subcheck:{user.id}:{cid}')])
+    try:
+        prompt=await send_formatted(context.bot,cid,settings.get('subscription_text') or DEFAULT['subscription_text'],user,K(rows))
+        with conn() as c:
+            c.execute('INSERT OR REPLACE INTO subscription_prompts(chat,uid,mid) VALUES (?,?,?)',(cid,user.id,prompt.message_id));c.commit()
+    except TelegramError:
+        log.exception('Cannot send resubscription prompt to %s in %s',user.id,cid)
+    raise ApplicationHandlerStop
 
 
 async def new_members(update,context):
@@ -2523,6 +2577,7 @@ def main():
     conn().close()
     app=ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL,blocked_user_guard),group=-1)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,enforce_ongoing_subscription),group=-2)
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CommandHandler('admin',owner_panel))
     app.add_handler(CommandHandler('setstart',set_start_text))

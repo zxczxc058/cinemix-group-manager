@@ -35,7 +35,7 @@ RECENT_JOINS = {}
 DEFAULT = {
  'links': True, 'max_warn': 3, 'delete_slash_commands': True, 'welcome': True, 'welcome_text': '👋 ברוך הבא {user}!\nשמחים שהצטרפת אלינו 💜',
  'welcome_buttons': [], 'welcome_media': None, 'welcome_seconds': 300,
- 'service_delete': True, 'channel_posts_delete': False, 'required_channel': '', 'subscription_url': '', 'subscription_text': '📢 {user}, כדי להשתתף בקבוצה יש להצטרף לערוץ ולאשר את ההצטרפות.', 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
+ 'service_delete': True, 'channel_posts_delete': False, 'subscription_enabled': True, 'required_channel': '', 'subscription_url': '', 'subscription_text': '📢 {user}, כדי להשתתף בקבוצה יש להצטרף לערוץ ולאשר את ההצטרפות.', 'verify': False, 'verify_text': 'שלום {user}, לחץ על הכפתור כדי לאמת את עצמך.',
  'flood': False, 'flood_count': 5, 'flood_seconds': 10, 'flood_mute': 1800,
  'words': [], 'word_action': 'delete', 'word_mute': 1800,
  'lock_text': '🔒 הקבוצה ננעלה', 'unlock_text': '🔓 הקבוצה נפתחה',
@@ -488,7 +488,7 @@ def menu(cid):
         [('🗑️ מחיקת פקודות',f'page:command_cleanup:{cid}'),('📣 הודעות ערוץ',f'page:channels:{cid}')],
         [('🛡️ אנטי ספאם',f'page:flood:{cid}'),('🚫 מילים אסורות',f'page:words:{cid}')],
         [('👋 ברוכים הבאים',f'page:welcome:{cid}'),('✅ אימות',f'page:verify:{cid}')],
-        [('📢 חובת הצטרפות לערוץ',f'page:subscription:{cid}')],
+        [('📢 חובת הצטרפות לערוץ',f'page:subscription:{cid}'),('🔗 קישורים',f'page:links:{cid}')],
         [('🔒 נעילה',f'page:lock:{cid}'),('🕯️ שבת וחג',f'page:calendar:{cid}')],
         [('👮 משתמשים',f'page:users:{cid}'),('🛡️ מורשים',f'page:allowlist:{cid}')],
         [('🕵️ מנהל סמוי',f'page:stealth:{cid}'),('🤖 תגובות',f'page:replies:{cid}')],
@@ -942,6 +942,7 @@ def page_keyboard(cid,page):
     if page=='command_cleanup':rows.append([('🟢 פעיל' if d['delete_slash_commands'] else '🔴 כבוי',f'toggle:delete_slash_commands:{cid}')])
     if page=='links':rows.append([(f'⚠️ אזהרות: {d["max_warn"]}',f'edit:max_warn:{cid}')])
     if page=='subscription':
+        rows.append([('🟢 חובת הצטרפות פעילה' if d.get('subscription_enabled',True) else '🔴 חובת הצטרפות כבויה',f'subtoggle:x:{cid}')])
         rows.append([('📢 ערוץ: '+(str(d.get('required_channel')) or 'לא הוגדר'),f'edit:required_channel:{cid}')])
         rows.append([('🔗 קישור הצטרפות לערוץ',f'edit:subscription_url:{cid}')])
         rows.append([('✏️ עריכת הודעת הצטרפות',f'edit:subscription_text:{cid}')])
@@ -1458,6 +1459,23 @@ async def callbacks(update,context):
     if action=='help':
         await q.answer();await panel_from_query(q,explanation_text(value),reply_markup=kb([('⬅️ חזרה',f'page:{value}:{cid}')]))
         return
+    if action=='subtoggle':
+        d=cfg(cid)
+        if not d.get('required_channel'):
+            await q.answer('יש להגדיר ערוץ לפני ההפעלה',show_alert=True);return
+        enabled=not d.get('subscription_enabled',True)
+        set_cfg(cid,'subscription_enabled',enabled)
+        if not enabled:
+            with conn() as c:
+                users=c.execute('SELECT uid FROM pending_subscription WHERE chat=?',(cid,)).fetchall()
+                c.execute('DELETE FROM pending_subscription WHERE chat=?',(cid,));c.commit()
+            for item in users:
+                try:
+                    member=await context.bot.get_chat_member(cid,item['uid'])
+                    await complete_join(context.bot,cid,member.user,context)
+                except TelegramError:log.exception('Failed to release user after disabling subscription')
+        await q.answer('נשמר')
+        await refresh_settings(q,cid,'subscription');return
     if action=='subclear':
         set_cfg(cid,'required_channel','')
         await q.answer('החובה בוטלה; משתמשים שממתינים עדיין צריכים להשלים אימות פעיל')
@@ -1961,7 +1979,7 @@ async def process_new_member(bot,cid,user,context):
             if now-t>60:RECENT_JOINS.pop(k,None)
     d=cfg(cid)
     metric(cid,'joins')
-    need_sub=bool(d.get('required_channel')) and not await subscription_member(bot,cid,user.id)
+    need_sub=bool(d.get('subscription_enabled',True) and d.get('required_channel')) and not await subscription_member(bot,cid,user.id)
     need_verify=bool(d.get('verify'))
     if need_verify or need_sub:
         # Restrict first, and only persist pending checks after successful restriction.

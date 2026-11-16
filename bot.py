@@ -97,6 +97,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS seen (chat INTEGER, mid INTEGER, ts INTEGER, PRIMARY KEY(chat,mid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_verify (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS pending_subscription (chat INTEGER, uid INTEGER, PRIMARY KEY(chat,uid))')
+    c.execute('CREATE TABLE IF NOT EXISTS subscription_prompts (chat INTEGER, uid INTEGER, mid INTEGER, PRIMARY KEY(chat,uid))')
     c.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS welcomes (chat INTEGER PRIMARY KEY, mid INTEGER, expires INTEGER)')
     c.execute('CREATE TABLE IF NOT EXISTS mutes (chat INTEGER, uid INTEGER, original TEXT, PRIMARY KEY(chat,uid))')
@@ -648,11 +649,11 @@ def owner_menu():
     return kb(
         [('📊 תמונת מצב', 'owner:overview:0'),('👥 כל הקבוצות','list:all:0')],
         [('📥 בקשות ממתינות','owner:pending:0'),('👤 משתמשי הבוט','botusers:list:0')],
-        [('🩺 בריאות קבוצות','owner:health:0')],
-        [('📣 פרסום מרכזי','owner:broadcast:0'),('📈 פעילות מערכת','owner:metrics:0')],
-        [('📝 הודעת פתיחה','owner:start:0'),('⚙️ הגדרות מערכת','owner:settings:0')],
-        [('💾 גיבויים','owner:backups:0'),('🛠️ תחזוקה','owner:maintenance:0')],
-         [('📝 ניהול הסברים והודעות מערכת','owner:explanations:0'),('👮 הרשאות מנהלים','access:list:0')])
+        [('🩺 בריאות קבוצות','owner:health:0'),('📣 פרסום מרכזי','owner:broadcast:0')],
+        [('📈 פעילות מערכת','owner:metrics:0'),('📝 הודעת פתיחה','owner:start:0')],
+        [('⚙️ הגדרות מערכת','owner:settings:0'),('💾 גיבויים','owner:backups:0')],
+        [('🛠️ תחזוקה','owner:maintenance:0'),('📝 ניהול הסברים והודעות מערכת','owner:explanations:0')],
+        [('👮 הרשאות מנהלים','access:list:0')])
 
 
 async def owner_dashboard(bot,recipient,section):
@@ -1260,7 +1261,16 @@ async def callbacks(update,context):
     if action=='subcheck':
         if int(value)!=uid:await q.answer('הכפתור מיועד למשתמש אחר',show_alert=True);return
         if await subscription_member(context.bot,cid,uid):
-            with conn() as c:c.execute('DELETE FROM pending_subscription WHERE chat=? AND uid=?',(cid,uid));c.commit()
+            with conn() as c:
+                prompt=c.execute('SELECT mid FROM subscription_prompts WHERE chat=? AND uid=?',(cid,uid)).fetchone()
+                c.execute('DELETE FROM pending_subscription WHERE chat=? AND uid=?',(cid,uid))
+                c.execute('DELETE FROM subscription_prompts WHERE chat=? AND uid=?',(cid,uid))
+                c.commit()
+            if prompt:
+                await safe_delete(context.bot,cid,prompt['mid'])
+            else:
+                # Backward compatibility for prompts sent before this update.
+                await safe_delete(context.bot,cid,q.message.message_id)
             await q.answer('ההצטרפות אומתה!')
             await complete_join(context.bot,cid,q.from_user,context)
         else:await q.answer('לא נמצאה הצטרפות לערוץ. ודא שהצטרפת ונסה שוב.',show_alert=True)
@@ -1997,7 +2007,10 @@ async def process_new_member(bot,cid,user,context):
             if not url and channel.startswith('@'):url='https://t.me/'+channel[1:]
             if url:rows.append([B('📢 הצטרפות לערוץ',url=url)])
             rows.append([B('✅ אישור הצטרפות',callback_data=f'subcheck:{user.id}:{cid}')])
-            await send_formatted(bot,cid,d.get('subscription_text') or DEFAULT['subscription_text'],user,K(rows))
+            prompt=await send_formatted(bot,cid,d.get('subscription_text') or DEFAULT['subscription_text'],user,K(rows))
+            with conn() as c:
+                c.execute('INSERT OR REPLACE INTO subscription_prompts(chat,uid,mid) VALUES (?,?,?)',(cid,user.id,prompt.message_id))
+                c.commit()
     elif d['welcome']:
         await welcome(bot,cid,user,context)
 
